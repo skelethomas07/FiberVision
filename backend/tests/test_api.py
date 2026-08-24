@@ -1,3 +1,5 @@
+from io import BytesIO
+from PIL import Image
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -26,6 +28,10 @@ class FakeEngine:
             )
         ], summary={"n_predictions": 1})
 
+def _valid_jpeg_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("L", (32, 32), color=128).save(buffer, format="JPEG")
+    return buffer.getvalue()
 
 def test_upload_analyze_review_and_approve(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path/'api.db'}", connect_args={"check_same_thread": False})
@@ -38,7 +44,7 @@ def test_upload_analyze_review_and_approve(tmp_path):
 
     upload = client.post(
         "/api/images",
-        files={"file": ("sample.jpg", b"fake-jpeg", "image/jpeg")},
+        files={"file": ("sample.jpg", _valid_jpeg_bytes(), "image/jpeg")},
         data={"nm_per_pixel": "2.0"},
     )
     assert upload.status_code == 201
