@@ -37,9 +37,8 @@ jobs:
             --comment "Deploy FiberVision from GitHub Actions" \
             --parameters 'commands=[
               "set -e",
+              "sudo -u ubuntu -H bash -lc '\''cd /home/ubuntu/FiberVision && git fetch origin main && git pull --ff-only origin main'\''",
               "cd /home/ubuntu/FiberVision",
-              "git fetch origin main",
-              "git pull --ff-only origin main",
               "docker compose up -d --build",
               "docker compose ps"
             ]' \
