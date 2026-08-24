@@ -116,7 +116,9 @@ class SemFiberEngine:
             from sem_fiber_ai.src.width_calibration import load_width_calibration
             width_calib = load_width_calibration(self.width_calibration_path)
 
-        table = load_calibration_table(self.calibration_table_path)
+        table = {}
+        if self.calibration_table_path and self.calibration_table_path.is_file():
+            table = load_calibration_table(self.calibration_table_path)
         thick_cfg = None
         if self.thick_recovery:
             from sem_fiber_ai.src.thick_fiber import ThickRecoveryConfig

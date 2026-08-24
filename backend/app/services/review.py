@@ -7,6 +7,8 @@ from typing import Any, Iterable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .review_labels import supervision_label
+
 from ..models import (
     AnalysisJob,
     AnalysisStatus,
@@ -168,14 +170,12 @@ def approve_review(session: Session, review_id: str) -> dict[str, Any]:
             "width_px": row.width_px, "width_nm": row.width_nm, "angle_deg": row.angle_deg,
         }
 
-        if model is None:
-            label, is_fiber, measure_here = "MANUAL_ADD", True, True
-        elif not row.active:
-            label, is_fiber, measure_here = "AUTO_REMOVE", None, False
-        elif row.edited:
-            label, is_fiber, measure_here = "MANUAL_CORRECT", True, True
-        else:
-            label, is_fiber, measure_here = "AUTO_KEEP", True, True
+        label, is_fiber, measure_here = supervision_label(
+            has_model=model is not None,
+            model_source=model.source if model else None,
+            active=row.active,
+            edited=row.edited,
+        )
 
         session.add(TrainingExample(
             review_id=review_id,

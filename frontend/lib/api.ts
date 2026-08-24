@@ -20,6 +20,8 @@ export type ImageAsset = {
   filename: string;
   nm_per_pixel: number | null;
   content_url: string;
+  input_mode: "raw_sem" | "visionflux_annotated";
+  imported_measurements: number;
 };
 
 export type AnalysisJob = {

@@ -28,11 +28,11 @@ export default function HomePage() {
     <main className="page"><section className="hero">
       <span className="badge">SEM · Human in the loop</span>
       <h1>Fiber Thickness Analysis</h1>
-      <p className="muted">SEM 이미지를 올리면 v6.11 모델과 wide-fiber recovery가 측정선을 생성합니다. 결과를 직접 수정한 뒤 승인하면 다음 학습 데이터로 누적됩니다.</p>
+      <p className="muted">원본 SEM과 VisionFlux 측정선 이미지(JPG/PNG/TIFF)를 구분 없이 업로드할 수 있습니다. 원본 SEM은 v6.11 모델로 분석하고, 노란색/파란색 VisionFlux 측정선이 있으면 기존 측정값을 불러와 바로 이어서 검수합니다.</p>
       <form className="card upload-box" onSubmit={submit}>
-        <label className="file-input"><strong>SEM 이미지</strong><br/><input type="file" accept="image/jpeg,image/png,image/tiff,image/bmp" onChange={(e) => setFile(e.target.files?.[0] ?? null)} /></label>
+        <label className="file-input"><strong>SEM 이미지</strong><br/><input type="file" accept="image/jpeg,image/png,image/tiff,image/bmp,.tif,.tiff" onChange={(e) => setFile(e.target.files?.[0] ?? null)} /></label>
         <label className="field"><span>nm / pixel <span className="muted">(알고 있으면 입력)</span></span><input type="number" min="0" step="any" value={nmPerPixel} onChange={(e) => setNmPerPixel(e.target.value)} placeholder="예: 2.0" /></label>
-        <div className="actions"><button className="primary" disabled={!file || busy}>{busy ? "업로드 중…" : "분석 시작"}</button>{file && <span className="muted">{file.name}</span>}</div>
+        <div className="actions"><button className="primary" disabled={!file || busy}>{busy ? "업로드 중…" : "분석 또는 검수 시작"}</button>{file && <span className="muted">{file.name}</span>}</div>
         {error && <p className="error">{error}</p>}
       </form>
     </section></main>

@@ -16,3 +16,4 @@ backend/models/*.pth
 backend/models/*.ckpt
 *.sqlite3
 .DS_Store
+/models/

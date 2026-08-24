@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..models import AnalysisJob, AnalysisStatus, ModelMeasurement
-from ..services.analysis import create_analysis
+from ..services.analysis import create_analysis, create_imported_analysis
 from ..services.review import get_or_create_review
+from ..services.visionflux_import import import_storage_key
 from .reviews import serialize_review
 
 router = APIRouter(prefix="/api/analyses", tags=["analyses"])
@@ -28,11 +31,26 @@ def _job(job: AnalysisJob):
     }
 
 
+def _visionflux_import(request: Request, image_id: str) -> list[dict] | None:
+    try:
+        raw = request.app.state.storage.get_bytes(import_storage_key(image_id))
+    except Exception:
+        return None
+    payload = json.loads(raw.decode("utf-8"))
+    rows = payload.get("measurements") or []
+    return rows if rows else None
+
+
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
 def create(payload: AnalysisCreate, request: Request):
     with request.app.state.Session() as session:
         try:
-            job = create_analysis(session, payload.image_id, request.app.state.queue, request.app.state.model_version)
+            imported = _visionflux_import(request, payload.image_id)
+            job = (
+                create_imported_analysis(session, payload.image_id, imported, request.app.state.model_version)
+                if imported
+                else create_analysis(session, payload.image_id, request.app.state.queue, request.app.state.model_version)
+            )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return _job(job)
@@ -69,8 +87,12 @@ def get_result(analysis_id: str, request: Request):
                 {
                     "id": row.id,
                     "external_id": row.external_id,
-                    "x1": row.x1, "y1": row.y1, "x2": row.x2, "y2": row.y2,
-                    "width_px": row.width_px, "width_nm": row.width_nm,
+                    "x1": row.x1,
+                    "y1": row.y1,
+                    "x2": row.x2,
+                    "y2": row.y2,
+                    "width_px": row.width_px,
+                    "width_nm": row.width_nm,
                     "angle_deg": row.angle_deg,
                     "confidence": row.confidence,
                     "source": row.source,

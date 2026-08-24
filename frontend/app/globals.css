@@ -7,6 +7,7 @@ button:hover:not(:disabled) { border-color:#8392aa; }
 button:disabled { opacity:.45; cursor:not-allowed; }
 button.primary { background:#172033; color:white; border-color:#172033; }
 button.active { background:#dff8fb; border-color:#33b8c9; }
+button.danger-active { background:#ffe5e8; border-color:#ff6675; color:#a91f31; }
 .page { max-width:1280px; margin:0 auto; padding:36px 24px 60px; }
 .hero { max-width:760px; margin:70px auto 0; }
 h1 { font-size:34px; margin:0 0 10px; letter-spacing:-.04em; }
@@ -31,6 +32,8 @@ h2 { letter-spacing:-.03em; }
 .viewer-toolbar .selected-info { color:#be4056; }
 .canvas-shell { height:min(72vh, 820px); min-height:480px; width:100%; background:#0b1020; overflow:hidden; }
 .canvas-shell canvas { display:block; touch-action:none; cursor:crosshair; }
+.canvas-shell canvas.delete-mode { cursor:not-allowed; }
+.canvas-shell canvas.add-mode { cursor:crosshair; }
 .viewer-help { margin:0; padding:9px 13px 12px; color:#7a8597; font-size:13px; }
 .review-actions { display:flex; justify-content:flex-end; gap:10px; padding:16px 0; }
 .summary { display:flex; gap:16px; flex-wrap:wrap; margin:0 0 16px; color:#59677e; }
