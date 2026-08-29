@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app.inference.contracts import AnalysisResult, MeasurementPrediction
 from app.main import create_app
+from app.services.auth import create_user
 from app.storage import LocalObjectStorage
 from app.workers.analysis import run_analysis_job
 
@@ -28,6 +29,7 @@ class FakeEngine:
             )
         ], summary={"n_predictions": 1})
 
+
 def _valid_jpeg_bytes() -> bytes:
     buffer = BytesIO()
     Image.new("L", (32, 32), color=128).save(buffer, format="JPEG")
@@ -41,6 +43,11 @@ def test_upload_analyze_review_and_approve(tmp_path):
     storage = LocalObjectStorage(tmp_path / "objects")
     app = create_app(session_factory=Session, storage=storage, queue=queue)
     client = TestClient(app)
+
+    with Session() as session:
+        create_user(session, "reviewer@example.com", "Initial-pass-123!")
+    assert client.post("/api/auth/login", json={"email": "reviewer@example.com", "password": "Initial-pass-123!"}).status_code == 200
+    assert client.post("/api/auth/change-password", json={"new_password": "Review-pass-456!"}).status_code == 200
 
     upload = client.post(
         "/api/images",
@@ -69,6 +76,7 @@ def test_upload_analyze_review_and_approve(tmp_path):
     review_payload = review.json()
     review_id = review_payload["id"]
     measurement_id = review_payload["measurements"][0]["id"]
+    assert review_payload["measurements"][0]["confidence"] == .95
 
     patch = client.patch(
         f"/api/reviews/{review_id}",
@@ -80,6 +88,8 @@ def test_upload_analyze_review_and_approve(tmp_path):
     )
     assert patch.status_code == 200
     assert len(patch.json()["measurements"]) == 2
+    manual = next(item for item in patch.json()["measurements"] if item["source"] == "manual")
+    assert manual["confidence"] is None
 
     approved = client.post(f"/api/reviews/{review_id}/approve")
     assert approved.status_code == 200

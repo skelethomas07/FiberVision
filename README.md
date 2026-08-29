@@ -110,6 +110,10 @@ npm run dev
 ## HTTP flow
 
 ```text
+POST /api/auth/login
+GET  /api/auth/me
+POST /api/auth/change-password
+POST /api/auth/logout
 POST /api/images
 POST /api/analyses
 GET  /api/analyses/{id}
@@ -117,6 +121,10 @@ GET  /api/analyses/{id}/result
 GET  /api/analyses/{id}/review
 PATCH /api/reviews/{review_id}
 POST /api/reviews/{review_id}/approve
+GET  /api/analyses/{id}/exports/csv
+GET  /api/analyses/{id}/exports/overlay
+GET  /api/analyses/{id}/exports/labeled
+GET  /api/analyses/{id}/exports/bundle
 ```
 
 Job states:
@@ -125,6 +133,28 @@ Job states:
 QUEUED -> ANALYZING -> POSTPROCESSING -> DONE
                                    \-> FAILED
 ```
+
+## Access control and user provisioning
+
+FiberVision has no public signup page. Accounts are created by an administrator inside the API container:
+
+```bash
+docker compose exec api python -m app.cli.create_user user@example.com
+```
+
+The command securely prompts for the initial password twice. On the user's first login, FiberVision requires a new password before image, analysis, review, or export APIs can be used. Passwords are stored as Argon2id hashes and browser sessions use an HttpOnly cookie.
+
+Current EC2 deployment uses HTTP on a restricted security-group source IP, so `AUTH_COOKIE_SECURE=false`. Use a unique FiberVision password while HTTP is in use; set the value to `true` after HTTPS is enabled.
+
+Authentication settings:
+
+```text
+AUTH_SESSION_DAYS=7
+AUTH_COOKIE_NAME=fibervision_session
+AUTH_COOKIE_SECURE=false
+```
+
+Analysis results expose three work areas: `검수`, `결과`, and `내보내기`. Export downloads include CSV, final measurement overlay PNG, numbered-label PNG, and a ZIP bundle.
 
 ## Add reviewed images to the next training dataset
 
@@ -187,7 +217,7 @@ docs/superpowers/         design + implementation plan
 
 ## Current MVP limits
 
-- No authentication or per-user project isolation yet.
+- Authentication is enabled; analysis records are not yet isolated into per-user project/history views.
 - No automatic champion promotion.
 - No batch UI.
 - Database schema is created with SQLAlchemy `create_all`; add Alembic before a long-lived production deployment with schema migrations.

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from ..models import ReviewMeasurement, ReviewSession
+from ..models import ModelMeasurement, ReviewMeasurement, ReviewSession
 from ..services.review import apply_review_changes, approve_review
 
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
@@ -37,6 +37,9 @@ def serialize_review(session, review: ReviewSession):
         .where(ReviewMeasurement.review_id == review.id)
         .order_by(ReviewMeasurement.created_at, ReviewMeasurement.id)
     ).all()
+    model_ids = [row.source_model_measurement_id for row in rows if row.source_model_measurement_id]
+    models = session.scalars(select(ModelMeasurement).where(ModelMeasurement.id.in_(model_ids))).all() if model_ids else []
+    model_by_id = {model.id: model for model in models}
     return {
         "id": review.id,
         "analysis_id": review.analysis_id,
@@ -51,6 +54,11 @@ def serialize_review(session, review: ReviewSession):
                 "active": row.active,
                 "edited": row.edited,
                 "source": row.source,
+                "confidence": (
+                    None
+                    if row.source_model_measurement_id is None or row.source in {"manual", "visionflux_manual"}
+                    else (model_by_id[row.source_model_measurement_id].confidence if row.source_model_measurement_id in model_by_id else None)
+                ),
             }
             for row in rows
         ],

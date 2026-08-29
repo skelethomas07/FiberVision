@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     calibration_table_path: Path | None = None
     work_dir: Path = Path("./work")
     frontend_origin: str = "http://localhost:3000"
+    auth_session_days: int = 7
+    auth_cookie_name: str = "fibervision_session"
+    auth_cookie_secure: bool = False
 
 
 @lru_cache
