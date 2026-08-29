@@ -100,3 +100,24 @@ export function directionBins(angles: number[], binCount = 12): NumericBin[] {
   }
   return result;
 }
+
+
+export type HistoryShortcutEvent = {
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+};
+
+export function historyShortcut(event: HistoryShortcutEvent): "undo" | "redo" | null {
+  if (!(event.ctrlKey || event.metaKey) || event.shiftKey) return null;
+  const key = event.key.toLowerCase();
+  if (key === "z") return "undo";
+  if (key === "y") return "redo";
+  return null;
+}
+
+export function cyclicIndex(current: number, delta: number, length: number): number {
+  if (length <= 0) return 0;
+  return ((current + delta) % length + length) % length;
+}

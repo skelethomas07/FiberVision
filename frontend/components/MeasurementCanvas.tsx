@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from "react";
 import { buildReviewPatch, lineMetrics, type ReviewPatch } from "@/lib/geometry";
-import { fiberAngleFromMeasurement, sectorBounds, type SplitCount } from "@/lib/reviewView";
+import { cyclicIndex, fiberAngleFromMeasurement, historyShortcut, sectorBounds, type SplitCount } from "@/lib/reviewView";
 import type { ReviewMeasurement } from "@/lib/api";
 
 type CanvasLine = ReviewMeasurement;
@@ -155,6 +155,11 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
     return line.confidence != null && line.confidence < LOW_CONFIDENCE;
   }), [lines, lowConfidenceOnly, overlayOn]);
 
+  const lowConfidenceLines = useMemo(
+    () => lines.filter((line) => line.active && line.confidence != null && line.confidence < LOW_CONFIDENCE),
+    [lines],
+  );
+
   useEffect(() => {
     const canvas = canvasRef.current;
     const image = imageRef.current;
@@ -291,6 +296,47 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
     setSelectedId((current) => current === id ? null : current);
   }, [commitLines, lines]);
 
+  const focusLine = useCallback((line: CanvasLine) => {
+    const nextScale = Math.max(scale, 0.8);
+    const middle = { x: (line.x1 + line.x2) / 2, y: (line.y1 + line.y2) / 2 };
+    setScale(nextScale);
+    setOffset({ x: size.width / 2 - middle.x * nextScale, y: size.height / 2 - middle.y * nextScale });
+    setSelectedId(line.id);
+    setMode("select");
+  }, [scale, size]);
+
+  const moveLowConfidence = useCallback((delta: number, startAtFirst = false) => {
+    if (!lowConfidenceLines.length) return;
+    const current = lowConfidenceLines.findIndex((line) => line.id === selectedId);
+    const base = startAtFirst ? -1 : current >= 0 ? current : delta > 0 ? -1 : 0;
+    const index = cyclicIndex(base, delta, lowConfidenceLines.length);
+    focusLine(lowConfidenceLines[index]);
+  }, [focusLine, lowConfidenceLines, selectedId]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      const history = historyShortcut(event);
+      if (history === "undo") {
+        event.preventDefault();
+        undo();
+        return;
+      }
+      if (history === "redo") {
+        event.preventDefault();
+        redo();
+        return;
+      }
+      if (event.key === "Delete" && selectedId && !disabled) {
+        event.preventDefault();
+        removeLine(selectedId);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [disabled, redo, removeLine, selectedId, undo]);
+
   function onPointerDown(event: ReactPointerEvent<HTMLCanvasElement>) {
     event.currentTarget.setPointerCapture(event.pointerId);
     const screen = pointer(event);
@@ -420,6 +466,7 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
   const selected = useMemo(() => lines.find((line) => line.id === selectedId && line.active) ?? null, [lines, selectedId]);
   const selectedMetrics = selected ? lineMetrics(selected) : null;
   const activeCount = lines.filter((line) => line.active).length;
+  const lowConfidenceIndex = lowConfidenceLines.findIndex((line) => line.id === selectedId);
 
   return (
     <div className="review-workspace">
@@ -432,14 +479,15 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
           <ToolButton label="삭제" glyph="−" disabled={disabled} active={mode === "delete"} onClick={() => setMode("delete")}/>
         </div>
         <div className="tool-group">
+          <span className="tool-group-label">이력</span>
+          <ToolButton label="실행 취소" glyph="↶" disabled={disabled || !past.length} onClick={undo}/>
+          <ToolButton label="다시 실행" glyph="↷" disabled={disabled || !future.length} onClick={redo}/>
+        </div>
+        <div className="tool-group">
           <span className="tool-group-label">보기</span>
           <ToolButton label="돋보기" glyph="⌕" active={magnifierOn} onClick={() => setMagnifierOn((value) => !value)}/>
           <ToolButton label="측정선" glyph="━" active={overlayOn} onClick={() => setOverlayOn((value) => !value)}/>
           <ToolButton label="맞춤" glyph="□" onClick={() => fitCurrentSector()}/>
-        </div>
-        <div className="history-buttons">
-          <button disabled={disabled || !past.length} onClick={undo} title="실행 취소">↶</button>
-          <button disabled={disabled || !future.length} onClick={redo} title="다시 실행">↷</button>
         </div>
       </aside>
 
@@ -452,7 +500,11 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
           </div>
           <div className="viewer-controls">
             <label className="compact-select">필터
-              <select value={lowConfidenceOnly ? "low" : "all"} onChange={(event) => setLowConfidenceOnly(event.target.value === "low")}>
+              <select value={lowConfidenceOnly ? "low" : "all"} onChange={(event) => {
+                const lowOnly = event.target.value === "low";
+                setLowConfidenceOnly(lowOnly);
+                if (lowOnly && lowConfidenceLines.length) window.requestAnimationFrame(() => moveLowConfidence(1, true));
+              }}>
                 <option value="all">전체</option>
                 <option value="low">낮은 신뢰도 &lt; 0.70</option>
               </select>
@@ -468,6 +520,13 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
                 <button onClick={() => moveSector(-1)} aria-label="이전 영역">‹</button>
                 <strong>{sectorIndex + 1} / {splitCount}</strong>
                 <button onClick={() => moveSector(1)} aria-label="다음 영역">›</button>
+              </div>
+            )}
+            {lowConfidenceOnly && (
+              <div className="confidence-nav" title="낮은 신뢰도 측정선 순차 검수">
+                <button disabled={!lowConfidenceLines.length} onClick={() => moveLowConfidence(-1)} aria-label="이전 낮은 신뢰도 측정선">‹</button>
+                <strong>{lowConfidenceLines.length ? `${lowConfidenceIndex >= 0 ? lowConfidenceIndex + 1 : 0} / ${lowConfidenceLines.length}` : "0 / 0"}</strong>
+                <button disabled={!lowConfidenceLines.length} onClick={() => moveLowConfidence(1)} aria-label="다음 낮은 신뢰도 측정선">›</button>
               </div>
             )}
           </div>
@@ -487,7 +546,7 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
           />
         </div>
         <div className="viewer-hint">
-          <span>휠 확대/축소</span><span>빈 공간 드래그 이동</span><span>{mode === "edit" ? "흰 점을 드래그해 수정" : "선을 클릭해 선택"}</span>
+          <span>휠 확대/축소</span><span>빈 공간 드래그 이동</span><span>{mode === "edit" ? "흰 점을 드래그해 수정" : "선을 클릭해 선택"}</span><span>Ctrl+Z / Ctrl+Y 실행 취소·다시 실행</span>
         </div>
       </section>
 

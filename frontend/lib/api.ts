@@ -75,6 +75,7 @@ export type AnalysisResult = {
   analysis_id: string;
   image_id: string;
   image_url: string;
+  image_filename: string;
   summary: Record<string, unknown>;
   measurements: Array<{
     id: string;

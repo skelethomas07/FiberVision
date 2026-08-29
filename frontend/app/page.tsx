@@ -59,7 +59,7 @@ function UploadWorkspace({ user }: { user: AuthUser }) {
       <section className="home-content">
         <div className="home-intro">
           <p className="eyebrow">SEM FIBER ANALYSIS</p>
-          <h1>이미지에서 측정까지,<br/>검수는 필요한 곳만.</h1>
+          <h1><span>이미지에서 측정까지.</span><span>검수는 필요한 곳만.</span></h1>
           <p>원본 SEM과 VisionFlux 결과 이미지를 같은 곳에서 분석하고 이어서 검수할 수 있습니다.</p>
         </div>
 

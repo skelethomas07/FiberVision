@@ -5,6 +5,8 @@ import {
   directionBins,
   fiberAngleFromMeasurement,
   histogramBins,
+  historyShortcut,
+  cyclicIndex,
   measurementStats,
   normalizeFiberAngle,
   sectorBounds,
@@ -52,4 +54,19 @@ test("histogramBins creates stable bins including the maximum value", () => {
 
 test("directionBins counts normalized fiber orientations", () => {
   assert.deepEqual(directionBins([0, 10, 179, -10, 190], 6).map((bin) => bin.count), [3, 0, 0, 0, 0, 2]);
+});
+
+
+test("historyShortcut uses Ctrl+Z for undo and Ctrl+Y for redo", () => {
+  assert.equal(historyShortcut({ key: "z", ctrlKey: true, metaKey: false, shiftKey: false }), "undo");
+  assert.equal(historyShortcut({ key: "Y", ctrlKey: true, metaKey: false, shiftKey: false }), "redo");
+  assert.equal(historyShortcut({ key: "z", ctrlKey: true, metaKey: false, shiftKey: true }), null);
+  assert.equal(historyShortcut({ key: "z", ctrlKey: false, metaKey: false, shiftKey: false }), null);
+});
+
+test("cyclicIndex wraps low-confidence navigation", () => {
+  assert.equal(cyclicIndex(0, -1, 5), 4);
+  assert.equal(cyclicIndex(4, 1, 5), 0);
+  assert.equal(cyclicIndex(1, 1, 5), 2);
+  assert.equal(cyclicIndex(0, 1, 0), 0);
 });

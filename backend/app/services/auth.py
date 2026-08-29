@@ -26,8 +26,8 @@ def normalize_email(email: str) -> str:
 
 
 def _validate_password(password: str) -> None:
-    if len(password) < 10:
-        raise ValueError("password must be at least 10 characters")
+    if len(password) < 8:
+        raise ValueError("password must be at least 8 characters")
 
 
 def _token_hash(token: str) -> str:

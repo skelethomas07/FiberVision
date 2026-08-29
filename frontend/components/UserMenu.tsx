@@ -9,6 +9,11 @@ export default function UserMenu({ user }: { user: AuthUser }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  function openPasswordChange() {
+    setOpen(false);
+    router.push("/change-password");
+  }
+
   async function signOut() {
     setBusy(true);
     try { await logout(); } finally { router.replace("/login"); }
@@ -25,7 +30,8 @@ export default function UserMenu({ user }: { user: AuthUser }) {
         <div className="user-popover">
           <span className="user-popover-label">로그인 계정</span>
           <strong>{user.email}</strong>
-          <button disabled={busy} onClick={signOut}>{busy ? "로그아웃 중…" : "로그아웃"}</button>
+          <button className="user-menu-action" disabled={busy} onClick={openPasswordChange}>비밀번호 변경</button>
+          <button className="user-menu-action danger" disabled={busy} onClick={signOut}>{busy ? "로그아웃 중…" : "로그아웃"}</button>
         </div>
       )}
     </div>

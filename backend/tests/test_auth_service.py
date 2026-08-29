@@ -68,3 +68,11 @@ def test_change_password_clears_initial_flag_and_invalidates_old_password(tmp_pa
         assert user.must_change_password is False
         assert authenticate_user(session, user.email, "Initial-pass-123!") is None
         assert authenticate_user(session, user.email, "New-pass-456!").id == user.id
+
+
+def test_password_minimum_is_eight_characters(tmp_path):
+    with make_session(tmp_path) as session:
+        user = create_user(session, "short@example.com", "Abcd1234")
+        assert authenticate_user(session, user.email, "Abcd1234").id == user.id
+        with pytest.raises(ValueError, match="at least 8"):
+            create_user(session, "too-short@example.com", "Abc1234")

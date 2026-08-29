@@ -67,10 +67,10 @@ def test_labeled_overlay_differs_and_zip_contains_all_exports():
     plain = render_overlay(sample_png(), [row()], labeled=False)
     labeled = render_overlay(sample_png(), [row()], labeled=True)
     assert plain != labeled
-    bundle = build_export_zip(sample_png(), [row()])
+    bundle = build_export_zip(sample_png(), [row()], base_name="sample_image_1")
     with ZipFile(BytesIO(bundle)) as archive:
-        assert set(archive.namelist()) == {"measurements.csv", "measurements_overlay.png", "measurements_labeled.png"}
-        assert archive.read("measurements.csv").startswith(b"\xef\xbb\xbf")
+        assert set(archive.namelist()) == {"sample_image_1_measurements.csv", "sample_image_1_overlay.png", "sample_image_1_labeled.png"}
+        assert archive.read("sample_image_1_measurements.csv").startswith(b"\xef\xbb\xbf")
 
 
 def make_export_client(tmp_path):
@@ -80,7 +80,7 @@ def make_export_client(tmp_path):
     storage = LocalObjectStorage(tmp_path / "objects")
     with Session() as session:
         create_user(session, "user@example.com", "Initial-pass-123!")
-        image = ImageAsset(original_filename="sample.png", content_type="image/png", storage_key="images/sample.png", size_bytes=10, nm_per_pixel=2.0)
+        image = ImageAsset(original_filename="sample image (1).tif", content_type="image/png", storage_key="images/sample.png", size_bytes=10, nm_per_pixel=2.0)
         session.add(image); session.flush()
         analysis = AnalysisJob(image_id=image.id, status=AnalysisStatus.DONE, progress=100, model_version="v6.11")
         session.add(analysis); session.flush()
@@ -113,6 +113,10 @@ def test_export_endpoints_are_authenticated_and_downloadable(tmp_path):
     assert csv_response.status_code == 200
     assert csv_response.headers["content-type"].startswith("text/csv")
     assert "attachment" in csv_response.headers["content-disposition"]
+    assert "sample_image_1_measurements.csv" in csv_response.headers["content-disposition"]
     bundle = client.get(f"/api/analyses/{analysis_id}/exports/bundle")
     assert bundle.status_code == 200
     assert bundle.headers["content-type"] == "application/zip"
+    assert "sample_image_1_exports.zip" in bundle.headers["content-disposition"]
+    with ZipFile(BytesIO(bundle.content)) as archive:
+        assert set(archive.namelist()) == {"sample_image_1_measurements.csv", "sample_image_1_overlay.png", "sample_image_1_labeled.png"}

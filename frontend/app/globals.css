@@ -79,7 +79,8 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 .user-popover { position: absolute; right: 0; top: calc(100% + 8px); width: 245px; padding: 14px; display: grid; gap: 9px; background: #fff; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 18px 50px rgba(27, 39, 55, .14); z-index: 50; }
 .user-popover-label { font-size: 11px; color: #7b8799; }
 .user-popover strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
-.user-popover button { margin-top: 4px; text-align: left; color: #a63243; }
+.user-popover button { margin-top: 4px; text-align: left; color: #4d5a6d; }
+.user-popover button.danger { color: #a63243; }
 
 /* Login */
 .auth-page {
@@ -113,8 +114,9 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 
 /* Home */
 .home-shell { background: linear-gradient(180deg, #fff 0, #f7f8fa 72%); }
-.home-content { width: min(1080px, calc(100% - 36px)); margin: 0 auto; padding: clamp(62px, 9vh, 112px) 0 90px; display: grid; grid-template-columns: minmax(280px, .85fr) minmax(430px, 1.15fr); align-items: center; gap: clamp(44px, 7vw, 94px); }
-.home-intro h1 { margin: 0 0 20px; color: #172231; font-size: clamp(36px, 4.2vw, 56px); line-height: 1.12; letter-spacing: -.058em; }
+.home-content { width: min(1240px, calc(100% - 36px)); margin: 0 auto; padding: clamp(62px, 9vh, 112px) 0 90px; display: grid; grid-template-columns: minmax(470px, .95fr) minmax(520px, 1.05fr); align-items: center; gap: clamp(44px, 7vw, 94px); }
+.home-intro h1 { margin: 0 0 20px; color: #172231; font-size: clamp(36px, 3.4vw, 48px); line-height: 1.16; letter-spacing: -.052em; word-break: keep-all; }
+.home-intro h1 span { display: block; white-space: nowrap; }
 .home-intro > p:last-child { max-width: 430px; margin: 0; color: #6c7889; line-height: 1.75; font-size: 15px; }
 .upload-card { padding: 18px; background: #fff; border: 1px solid #dce2e8; border-radius: 18px; box-shadow: 0 20px 55px rgba(28, 42, 58, .08); }
 .drop-zone { min-height: 250px; padding: 34px 22px; border: 1.5px dashed #bcc7d2; border-radius: 13px; background: #fafbfd; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; cursor: pointer; transition: .18s ease; outline: none; }
@@ -136,7 +138,7 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 .analysis-brand-row, .header-actions { display: flex; align-items: center; gap: 14px; }
 .header-divider { width: 1px; height: 28px; background: #dfe4e9; }
 .analysis-meta { display: grid; gap: 2px; }
-.analysis-meta strong { font-size: 13px; }
+.analysis-meta strong { max-width: min(36vw, 430px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .analysis-meta span { color: #7b8798; font-size: 11px; }
 .text-action { padding: 7px 9px; color: #596678; font-size: 12px; border-radius: 7px; }
 .text-action:hover { background: #f3f5f7; }
@@ -159,11 +161,9 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 .tool-button:hover:not(:disabled) { background: #f0f3f5; border-color: transparent; }
 .tool-button.active { background: #e5f2f3; color: #135f6b; border-color: #c9e2e5; }
 .tool-glyph { font-size: 18px; line-height: 1; font-weight: 500; }
-.history-buttons { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
-.history-buttons button { padding: 7px 0; color: #647184; background: #fff; }
 .viewer-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: #fff; }
 .viewer-bar { flex: 0 0 48px; padding: 0 12px; border-bottom: 1px solid #e2e6eb; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.viewer-bar-left, .viewer-controls, .sector-nav { display: flex; align-items: center; gap: 10px; }
+.viewer-bar-left, .viewer-controls, .sector-nav, .confidence-nav { display: flex; align-items: center; gap: 10px; }
 .viewer-bar-left strong { font-size: 11px; color: #475466; }
 .legend { display: inline-flex; align-items: center; gap: 5px; color: #7d8897; font-size: 10px; }
 .legend i { width: 13px; height: 2px; border-radius: 3px; display: inline-block; }
@@ -171,9 +171,10 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 .legend-manual { background: #51a9ff; }
 .compact-select { display: inline-flex; align-items: center; gap: 5px; color: #7a8595; font-size: 10px; }
 .compact-select select { border: 1px solid #d6dce3; border-radius: 7px; padding: 5px 22px 5px 7px; background: #fff; color: #465365; font-size: 10px; outline: none; }
-.sector-nav { gap: 4px; }
-.sector-nav button { width: 27px; height: 27px; padding: 0; border-radius: 7px; }
-.sector-nav strong { min-width: 42px; text-align: center; font-size: 10px; color: #4f5c6e; }
+.sector-nav, .confidence-nav { gap: 4px; }
+.sector-nav button, .confidence-nav button { width: 27px; height: 27px; padding: 0; border-radius: 7px; }
+.sector-nav strong, .confidence-nav strong { min-width: 42px; text-align: center; font-size: 10px; color: #4f5c6e; }
+.confidence-nav { padding-left: 8px; border-left: 1px solid #e0e5ea; }
 .canvas-shell { flex: 1 1 auto; min-height: 450px; width: 100%; background: var(--viewer); overflow: hidden; position: relative; }
 .canvas { display: block; touch-action: none; cursor: grab; }
 .canvas.mode-add { cursor: crosshair; }
@@ -265,7 +266,6 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
 
 @media (max-width: 1020px) {
   .home-content { grid-template-columns: 1fr; max-width: 680px; padding-top: 54px; }
-  .home-intro br { display: none; }
   .review-workspace { grid-template-columns: 72px minmax(0, 1fr); }
   .inspector { display: none; }
   .chart-grid { grid-template-columns: 1fr; }
@@ -284,8 +284,6 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
   .tool-group { display: flex; gap: 3px; }
   .tool-group-label { display: none; }
   .tool-button { width: 54px; min-height: 45px; flex: 0 0 54px; }
-  .history-buttons { margin: 0; display: flex; }
-  .history-buttons button { width: 38px; }
   .viewer-bar { height: auto; min-height: 55px; flex-wrap: wrap; padding: 7px 9px; }
   .viewer-bar-left .legend { display: none; }
   .viewer-controls { flex-wrap: wrap; justify-content: flex-end; }
@@ -302,6 +300,7 @@ button.primary:hover:not(:disabled), .primary.download-button:hover { background
   .bundle-card { align-items: stretch; flex-direction: column; }
   .home-content { width: min(100% - 24px, 680px); padding: 42px 0; gap: 28px; }
   .home-intro h1 { font-size: 35px; }
+  .home-intro h1 span { white-space: normal; }
   .upload-options { grid-template-columns: 1fr; gap: 9px; }
   .drop-zone { min-height: 210px; }
   .auth-card { padding: 28px 22px; }

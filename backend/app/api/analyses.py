@@ -82,6 +82,7 @@ def get_result(analysis_id: str, request: Request):
             "analysis_id": job.id,
             "image_id": job.image_id,
             "image_url": f"/api/images/{job.image_id}/content",
+            "image_filename": job.image.original_filename,
             "summary": job.summary_json or {},
             "measurements": [
                 {

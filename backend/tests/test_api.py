@@ -70,6 +70,7 @@ def test_upload_analyze_review_and_approve(tmp_path):
     payload = result.json()
     assert payload["measurements"][0]["width_px"] == 10
     assert payload["image_url"] == f"/api/images/{image_id}/content"
+    assert payload["image_filename"] == "sample.jpg"
 
     review = client.get(f"/api/analyses/{job_id}/review")
     assert review.status_code == 200

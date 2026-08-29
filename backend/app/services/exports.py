@@ -83,11 +83,11 @@ def render_overlay(image_bytes: bytes, rows, *, labeled: bool = False) -> bytes:
     return output.getvalue()
 
 
-def build_export_zip(image_bytes: bytes, rows) -> bytes:
+def build_export_zip(image_bytes: bytes, rows, *, base_name: str = "fiber") -> bytes:
     active = _active_rows(rows)
     output = BytesIO()
     with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
-        archive.writestr("measurements.csv", build_csv(active))
-        archive.writestr("measurements_overlay.png", render_overlay(image_bytes, active, labeled=False))
-        archive.writestr("measurements_labeled.png", render_overlay(image_bytes, active, labeled=True))
+        archive.writestr(f"{base_name}_measurements.csv", build_csv(active))
+        archive.writestr(f"{base_name}_overlay.png", render_overlay(image_bytes, active, labeled=False))
+        archive.writestr(f"{base_name}_labeled.png", render_overlay(image_bytes, active, labeled=True))
     return output.getvalue()

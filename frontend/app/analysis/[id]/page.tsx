@@ -69,6 +69,16 @@ function AnalysisWorkspace({ user }: { user: AuthUser }) {
   const onPatchChange = useCallback((next: ReviewPatch) => setPatch(next), []);
   const changeCount = patch.removed_ids.length + patch.corrected.length + patch.added.length;
 
+  useEffect(() => {
+    if (!changeCount) return;
+    const warnBeforeLeave = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeave);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeave);
+  }, [changeCount]);
+
   async function save(silent = false): Promise<ReviewResponse | null> {
     if (!review || review.status !== "OPEN") return review;
     if (!changeCount) return review;
@@ -100,6 +110,7 @@ function AnalysisWorkspace({ user }: { user: AuthUser }) {
 
   async function approve() {
     if (!review) return;
+    if (!window.confirm("검수를 완료하면 현재 결과가 확정되고 학습 데이터에 반영됩니다. 계속할까요?")) return;
     setSaving(true);
     setError(null);
     setMessage(null);
@@ -139,8 +150,8 @@ function AnalysisWorkspace({ user }: { user: AuthUser }) {
           <a className="brand" href="/"><span className="brand-symbol" aria-hidden="true"><i/><i/><i/></span><span>FiberVision</span></a>
           <span className="header-divider"/>
           <div className="analysis-meta">
-            <strong>Analysis {id.slice(0, 8)}</strong>
-            <span>{active.toLocaleString()} measurements · {job.model_version}</span>
+            <strong className="analysis-filename" title={result.image_filename}>{result.image_filename}</strong>
+            <span>Analysis {id.slice(0, 8)} · {active.toLocaleString()} measurements · {job.model_version}</span>
           </div>
         </div>
         <div className="header-actions"><a className="text-action" href="/">새 분석</a><UserMenu user={user}/></div>
