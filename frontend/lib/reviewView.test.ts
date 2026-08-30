@@ -6,7 +6,9 @@ import {
   fiberAngleFromMeasurement,
   histogramBins,
   historyShortcut,
+  normalizeConfidenceThreshold,
   cyclicIndex,
+  confidenceMatches,
   measurementStats,
   normalizeFiberAngle,
   sectorBounds,
@@ -69,4 +71,22 @@ test("cyclicIndex wraps low-confidence navigation", () => {
   assert.equal(cyclicIndex(4, 1, 5), 0);
   assert.equal(cyclicIndex(1, 1, 5), 2);
   assert.equal(cyclicIndex(0, 1, 0), 0);
+});
+
+test("confidenceMatches supports all low and normal filters with a configurable threshold", () => {
+  assert.equal(confidenceMatches(0.69, "low", 0.7), true);
+  assert.equal(confidenceMatches(0.7, "low", 0.7), false);
+  assert.equal(confidenceMatches(0.74, "low", 0.75), true);
+  assert.equal(confidenceMatches(0.8, "normal", 0.75), true);
+  assert.equal(confidenceMatches(0.7, "normal", 0.75), false);
+  assert.equal(confidenceMatches(null, "low", 0.75), false);
+  assert.equal(confidenceMatches(null, "normal", 0.75), true);
+  assert.equal(confidenceMatches(null, "all", 0.75), true);
+});
+
+test("normalizeConfidenceThreshold clamps user input to zero through one", () => {
+  assert.equal(normalizeConfidenceThreshold(0.8), 0.8);
+  assert.equal(normalizeConfidenceThreshold(-1), 0);
+  assert.equal(normalizeConfidenceThreshold(2), 1);
+  assert.equal(normalizeConfidenceThreshold(Number.NaN), 0.7);
 });

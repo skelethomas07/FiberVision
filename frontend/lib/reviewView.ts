@@ -121,3 +121,22 @@ export function cyclicIndex(current: number, delta: number, length: number): num
   if (length <= 0) return 0;
   return ((current + delta) % length + length) % length;
 }
+
+
+export type ConfidenceFilterMode = "all" | "low" | "normal";
+
+export function normalizeConfidenceThreshold(value: number, fallback = 0.7): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(1, Math.max(0, value));
+}
+
+export function confidenceMatches(
+  confidence: number | null,
+  mode: ConfidenceFilterMode,
+  threshold: number,
+): boolean {
+  if (mode === "all") return true;
+  const cutoff = normalizeConfidenceThreshold(threshold);
+  if (confidence == null) return mode === "normal";
+  return mode === "low" ? confidence < cutoff : confidence >= cutoff;
+}

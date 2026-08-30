@@ -56,6 +56,9 @@ export type ImageAsset = {
   id: string;
   filename: string;
   nm_per_pixel: number | null;
+  calibration_source: "manual" | "scale_bar" | "none";
+  scale_label: string | null;
+  scale_bar_px: number | null;
   content_url: string;
   input_mode: "raw_sem" | "visionflux_annotated";
   imported_measurements: number;

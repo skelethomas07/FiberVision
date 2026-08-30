@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from "react";
 import { buildReviewPatch, lineMetrics, type ReviewPatch } from "@/lib/geometry";
-import { cyclicIndex, fiberAngleFromMeasurement, historyShortcut, sectorBounds, type SplitCount } from "@/lib/reviewView";
+import { confidenceMatches, cyclicIndex, fiberAngleFromMeasurement, historyShortcut, normalizeConfidenceThreshold, sectorBounds, type ConfidenceFilterMode, type SplitCount } from "@/lib/reviewView";
 import type { ReviewMeasurement } from "@/lib/api";
 
 type CanvasLine = ReviewMeasurement;
@@ -23,7 +23,6 @@ type Props = {
 
 const LENS_RADIUS = 88;
 const LENS_ZOOM = 2.5;
-const LOW_CONFIDENCE = 0.7;
 const SPLITS: SplitCount[] = [6, 9, 12, 16];
 
 function cloneLines(lines: CanvasLine[]) {
@@ -74,7 +73,8 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
   const [mode, setMode] = useState<ToolMode>("select");
   const [magnifierOn, setMagnifierOn] = useState(true);
   const [overlayOn, setOverlayOn] = useState(true);
-  const [lowConfidenceOnly, setLowConfidenceOnly] = useState(false);
+  const [confidenceMode, setConfidenceMode] = useState<ConfidenceFilterMode>("all");
+  const [confidenceThresholdInput, setConfidenceThresholdInput] = useState("0.70");
   const [hoverPoint, setHoverPoint] = useState<Point | null>(null);
   const [drag, setDrag] = useState<DragState>(null);
   const [scale, setScale] = useState(1);
@@ -149,15 +149,19 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
   const screenToWorld = useCallback((point: Point) => ({ x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale }), [offset, scale]);
   const worldToScreen = useCallback((point: Point) => ({ x: offset.x + point.x * scale, y: offset.y + point.y * scale }), [offset, scale]);
 
+  const confidenceThreshold = useMemo(() => {
+    if (!confidenceThresholdInput.trim()) return 0.7;
+    return normalizeConfidenceThreshold(Number(confidenceThresholdInput));
+  }, [confidenceThresholdInput]);
+
   const visibleLines = useMemo(() => lines.filter((line) => {
     if (!line.active || !overlayOn) return false;
-    if (!lowConfidenceOnly) return true;
-    return line.confidence != null && line.confidence < LOW_CONFIDENCE;
-  }), [lines, lowConfidenceOnly, overlayOn]);
+    return confidenceMatches(line.confidence, confidenceMode, confidenceThreshold);
+  }), [confidenceMode, confidenceThreshold, lines, overlayOn]);
 
   const lowConfidenceLines = useMemo(
-    () => lines.filter((line) => line.active && line.confidence != null && line.confidence < LOW_CONFIDENCE),
-    [lines],
+    () => lines.filter((line) => line.active && confidenceMatches(line.confidence, "low", confidenceThreshold)),
+    [confidenceThreshold, lines],
   );
 
   useEffect(() => {
@@ -497,17 +501,32 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
             <strong>{activeCount.toLocaleString()} measurements</strong>
             <span className="legend"><i className="legend-auto"/>자동</span>
             <span className="legend"><i className="legend-manual"/>수동</span>
+            {calibration != null && <span className="calibration-badge">{calibration.toFixed(4)} nm/px</span>}
           </div>
           <div className="viewer-controls">
             <label className="compact-select">필터
-              <select value={lowConfidenceOnly ? "low" : "all"} onChange={(event) => {
-                const lowOnly = event.target.value === "low";
-                setLowConfidenceOnly(lowOnly);
-                if (lowOnly && lowConfidenceLines.length) window.requestAnimationFrame(() => moveLowConfidence(1, true));
+              <select value={confidenceMode} onChange={(event) => {
+                const next = event.target.value as ConfidenceFilterMode;
+                setConfidenceMode(next);
+                setSelectedId(null);
+                if (next === "low" && lowConfidenceLines.length) window.requestAnimationFrame(() => moveLowConfidence(1, true));
               }}>
                 <option value="all">전체</option>
-                <option value="low">낮은 신뢰도 &lt; 0.70</option>
+                <option value="low">낮은 신뢰도 &lt; {confidenceThreshold.toFixed(2)}</option>
+                <option value="normal">정상 ≥ {confidenceThreshold.toFixed(2)}</option>
               </select>
+            </label>
+            <label className="confidence-threshold">기준
+              <input
+                aria-label="신뢰도 기준"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                value={confidenceThresholdInput}
+                onChange={(event) => setConfidenceThresholdInput(event.target.value)}
+                onBlur={() => setConfidenceThresholdInput(confidenceThreshold.toFixed(2))}
+              />
             </label>
             <label className="compact-select">분할
               <select value={splitCount ?? "whole"} onChange={(event) => chooseSplit(event.target.value)}>
@@ -522,7 +541,7 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
                 <button onClick={() => moveSector(1)} aria-label="다음 영역">›</button>
               </div>
             )}
-            {lowConfidenceOnly && (
+            {confidenceMode === "low" && (
               <div className="confidence-nav" title="낮은 신뢰도 측정선 순차 검수">
                 <button disabled={!lowConfidenceLines.length} onClick={() => moveLowConfidence(-1)} aria-label="이전 낮은 신뢰도 측정선">‹</button>
                 <strong>{lowConfidenceLines.length ? `${lowConfidenceIndex >= 0 ? lowConfidenceIndex + 1 : 0} / ${lowConfidenceLines.length}` : "0 / 0"}</strong>
@@ -556,8 +575,17 @@ export default function MeasurementCanvas({ imageUrl, measurements, disabled = f
           <div className="inspector-content">
             <div className="metric-primary">
               <span>두께</span>
-              <strong>{selectedMetrics.width_px.toFixed(2)} <small>px</small></strong>
-              {calibration != null && <em>{(selectedMetrics.width_px * calibration).toFixed(2)} nm</em>}
+              {calibration != null ? (
+                <>
+                  <strong>{(selectedMetrics.width_px * calibration).toFixed(2)} <small>nm</small></strong>
+                  <em>{selectedMetrics.width_px.toFixed(2)} px</em>
+                </>
+              ) : (
+                <>
+                  <strong>{selectedMetrics.width_px.toFixed(2)} <small>px</small></strong>
+                  <em>스케일 보정 없음</em>
+                </>
+              )}
             </div>
             <dl className="metric-list">
               <div><dt>Fiber 방향</dt><dd>{fiberAngleFromMeasurement(selectedMetrics.angle_deg).toFixed(1)}°</dd></div>

@@ -98,10 +98,10 @@ function UploadWorkspace({ user }: { user: AuthUser }) {
 
           <div className="upload-options">
             <label className="compact-field">
-              <span>nm / pixel</span>
-              <input type="number" min="0" step="any" value={nmPerPixel} onChange={(event) => setNmPerPixel(event.target.value)} placeholder="선택사항"/>
+              <span>nm / pixel · 선택</span>
+              <input type="number" min="0.000001" step="any" value={nmPerPixel} onChange={(event) => setNmPerPixel(event.target.value)} placeholder="자동 감지"/>
             </label>
-            <p>VisionFlux 노란색·파란색 측정선이 포함된 이미지도 자동으로 인식합니다.</p>
+            <p>비워두면 이미지 하단 스케일바를 자동으로 읽습니다. 직접 입력한 값이 있으면 그 값을 우선 사용합니다.<br/>VisionFlux 노란색·파란색 측정선 이미지도 자동으로 인식합니다.</p>
           </div>
 
           {error && <p className="form-error">{error}</p>}

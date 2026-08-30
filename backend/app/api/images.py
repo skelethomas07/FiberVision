@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile, status
 
 from ..models import ImageAsset
+from ..services.scale_calibration import resolve_nm_per_pixel
 from ..services.visionflux_import import (
     import_storage_key,
     inspect_sem_upload,
@@ -34,7 +35,10 @@ async def upload_image(
     request.app.state.storage.put_bytes(key, data, file.content_type)
 
     try:
-        inspection = inspect_sem_upload(data, filename, nm_per_pixel)
+        calibration = resolve_nm_per_pixel(data, nm_per_pixel)
+        inspection = inspect_sem_upload(data, filename, calibration.nm_per_pixel)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"cannot read SEM image: {exc}") from exc
 
@@ -44,7 +48,7 @@ async def upload_image(
             content_type=file.content_type or "application/octet-stream",
             storage_key=key,
             size_bytes=len(data),
-            nm_per_pixel=nm_per_pixel,
+            nm_per_pixel=calibration.nm_per_pixel,
         )
         session.add(image)
         session.commit()
@@ -70,6 +74,9 @@ async def upload_image(
             "content_type": image.content_type,
             "size_bytes": image.size_bytes,
             "nm_per_pixel": image.nm_per_pixel,
+            "calibration_source": calibration.source,
+            "scale_label": calibration.scale_label,
+            "scale_bar_px": calibration.scale_bar_px,
             "content_url": f"/api/images/{image.id}/content",
             "input_mode": "visionflux_annotated" if inspection.is_visionflux_annotated else "raw_sem",
             "imported_measurements": len(inspection.measurements),
