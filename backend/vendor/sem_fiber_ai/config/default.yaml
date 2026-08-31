@@ -1,70 +1,107 @@
-# SEM fiber AI v7.0.0 - default configuration
+# SEM fiber measurement - default configuration (v2)
+# Every value here is a decision. Where a choice was uncertain the simplest
+# scientifically defensible option was taken and documented in the comment.
 #
-# Sections marked PROTOCOL define the scientific experiment.  They are hashed
-# into every checkpoint and manifest and NEVER depend on hardware.  The
-# `hardware` section holds performance-only knobs.
+# Changes from v1 are marked [v2] and all trace back to one diagnosis: the
+# manual CSVs are a SAMPLE of the measurable sites, not an exhaustive labelling,
+# and v1 treated every unsampled fiber pixel as a negative.
 
 seed: 1337
 deterministic: true
+device: auto            # auto | cuda | cpu
 
-# ---------------------------------------------------------------- PROTOCOL --
-protocol:                         # FULL_RUN (requires CUDA)
-  tile: 384
-  effective_batch: 8              # fixed; micro-batch x accumulation = this
-  epochs: 80
-  patience: 15                    # early stop on val_monitor only
-  lr: 0.0003
-  weight_decay: 0.0001
-  samples_per_image: 32
-  val_samples_per_image: 8
-  monitor: val_monitor            # uncertainty-free validation loss
+annotation:
+  length_units: auto                # auto | pixels | nm | um
 
-smoke_protocol:                   # FAST_SMOKE_TEST (CPU ok) - NOT a scientific run
-  tile: 128
-  effective_batch: 2
-  epochs: 2
-  patience: 2
-  lr: 0.001
-  weight_decay: 0.0001
-  samples_per_image: 4
-  val_samples_per_image: 2
-  monitor: val_monitor
-smoke_model:
-  preset: tiny
+data:
+  labels_csv: data/processed/labels.csv
+  image_dir: data/original          # CLEAN images only - never the annotated ones
+  mask_dir: null                    # optional *_overlay_mask.png (pixels to ignore)
 
-model:                            # PROTOCOL
-  preset: small                   # tiny | small | medium | large
-  in_channels: 1
-  dropout: 0.0
+# [v2] image-derived prior:
+  cache_and_warp: true              # [v4] cache the prior and warp it
+                                    # with the image matrix instead of
+                                    # recomputing it on every crop where the fibers are, and which way they run.
+prior:
+  enabled: true                     # false reproduces the v1 failure mode
+  audit: true                       # check the mask against the annotations first
+  strict: true                      # [v3] a failed audit RAISES. v2 logged an
+                                    # ERROR saying "tune config['prior'] first"
+                                    # and then trained anyway, twice.
+  sigmas: [1.0, 1.6, 2.5, 4.0, 6.0] # fiber radii to look for, in pixels
+  threshold: otsu                   # otsu | percentile
+  percentile: 70.0
+  dilate_px: 2                      # cover the fiber flanks, not just the core
+  min_object_px: 24
+  tensor_sigma: 2.0                 # structure tensor window
+  coherency_min: 0.25               # below this the local direction is meaningless
+  polarity: auto                    # auto | bright | dark (decided from the labels)
+  cache_dir: null                   # defaults to <output.dir>/prior_cache
 
-targets:                          # PROTOCOL
-  mode: geometry                  # geometry | baseline (kept for comparison)
-  orientation_source: image
+  # [v3] mask growth is now bounded. v2 flood-filled every bright connected
+  # component a ridge touched; on a dense mat that component is the whole frame
+  # (70-86% area on the manual fields, 94-100% on the pseudo-labelled ones).
+  flank_scale: 1.5                  # max growth from a ridge seed, in max(sigmas)
+  area_max: 0.85                    # loose backstop -- a mat CAN be 80% fiber
+  area_min: 0.05
+  auc_min: 0.80                     # the real gate: a mask that has leaked into
+                                    # the pores stops tracking intensity. 0.97 at
+                                    # 80% area is a dense field; 0.63 at 95% is
+                                    # leakage. Run tune_prior_config() to set
+                                    # flank_scale/area_max from your own fields.
+  auto_area: true
+  min_coverage: 0.90
+
+split:
+  val_frac: 0.2
+  test_frac: 0.2
+  duplicate_hamming: 6              # <= this many bits apart => same field => same split
+  group_by_specimen: true           # [v2] fields named <specimen>-<field> share a
+                                    # split. Five fields of one sample are not
+                                    # five independent observations, and counting
+                                    # them as such inflates every error bar.
+  stratify: true                    # [v2] balance the nm/px regime across splits.
+                                    # v1 put both test images in the one group
+                                    # whose pixel size never resolved, which
+                                    # confounds generalisation with a covariate
+                                    # shift the split itself created.
+
+targets:
+  sigma_scale: 0.22                 # heatmap sigma as a fraction of fiber width
+  sigma_min: 1.5
+  sigma_max: 6.0
+  reg_radius_scale: 0.35            # radius of the width/orientation supervision disc
+  reg_radius_min: 2.0
+  segment_thickness: 0.35
+  log_width: true                   # regress log(width): errors are multiplicative
+  ignore_radius_scale: 1.2          # ring around ambiguous labels, excluded from loss
+  y_sign: 1.0                       # set by annotation_extraction's geometry calibration
+
+  # [v2] the fix. An unmeasured fiber is unknown, not background.
+  ignore_unlabelled_fiber: true
+  # [v2] a hand-drawn chord is only roughly perpendicular to its fiber; on this
+  # dataset the disagreement reaches 26 deg. Supervising orientation from the
+  # chord teaches that scatter, so take it from the structure tensor instead.
+  orientation_source: image         # image | chord | blend
+  strict_angles: true               # [v3] with 'chord', refuse to pool fields
+                                    # that prefer different conventions
   coherency_min: 0.25
-  log_width: true
-  propagate_scale: 6.0
-  propagate_max_scale: 20.0
-  unverified_weight: 0.3
-  strata_edges: [0.0, 6.0, 9.0, 13.0, 18.0, 25.0, 1000000000.0]
-  strata_weight_cap: 6.0
+  dense_orientation: true
+  width_propagate_scale: 2.0        # carry a measured width this far along its fiber
+  negative_weight: 3.0              # reviewer-rejected sites count this much extra
+  negative_radius_px: 4.0
+  segment_from_prior: true
 
-loss:
-  uncertainty: true
-loss_weights:                     # PROTOCOL
-  center: 1.0
-  segment: 0.5
-  width: 1.0
-  orient: 0.5
-  validity: 0.3
-  dist: 1.0
-
-augment:                          # PROTOCOL
+augment:
   enabled: true
   hflip: 0.5
   vflip: 0.5
   rot90: 0.5
   rotate_deg: 20.0
-  scale_range: [0.8, 1.25]        # isotropic only
+  scale_range: [0.7, 1.4]           # [v2] widened to span the magnification range
+                                    # actually present in the dataset (1.0-5.0 nm/px).
+                                    # ISOTROPIC only - anisotropic scaling would
+                                    # change apparent thickness with orientation.
   translate_frac: 0.05
   brightness: 0.12
   contrast: 0.12
@@ -73,74 +110,105 @@ augment:                          # PROTOCOL
   blur_prob: 0.15
   blur_sigma: [0.4, 1.0]
 
-prior:                            # image-derived fibre mask / orientation field
-  sigmas: [1.0, 1.6, 2.5, 4.0, 6.0]
-  threshold: otsu
-  dilate_px: 2
-  min_object_px: 24
-  tensor_sigma: 2.0
-  coherency_min: 0.25
-  polarity: auto
-  flank_scale: 2.2
-  area_max: 0.85
-  area_min: 0.05
-  auc_min: 0.75
-  auto_area: true
-  min_coverage: 0.85
+model:
+  #   small - plain U-Net, ~2M params, from scratch. For a handful of images.
+  #   large - ImageNet ResNet-34 encoder + residual/SE decoder, ~25M params.
+  #           Appropriate from roughly 25-30 labelled fields upward -- which is
+  #           what the pseudo-labelling stage is for. On 7 labelled fields alone
+  #           'small' is the honest choice.
+  preset: large                     # small | large | null (use the fields below)
+  in_channels: 1
+  dropout: 0.0                      # > 0 enables MC-dropout uncertainty at inference
 
-split:                            # PROTOCOL
-  level: specimen                 # specimen | series | image
-  specimen_map: null              # optional yaml {image_id: specimen}
-  duplicate_hamming: 6
-  val_frac: 0.25
-  test_frac: 0.25
-  stratify: true
+baseline:
+  patch: 64
+  neg_per_pos: 1.0
+  base: 24
+  n_blocks: 4
+  dropout: 0.1
 
-physical:                         # PROTOCOL
-  resample_to_reference: auto     # auto | on | off
-  min_calibrated_fraction: 0.7
-  factor_range: [0.4, 2.5]
+loss:
+  uncertainty: true                 # heteroscedastic width loss
+  neg_boost: true                   # [v2] weight the reviewer-rejected sites
+loss_weights:
+  center: 1.0
+  segment: 0.5
+  width: 1.0
+  orient: 0.5
+  validity: 0.2
 
-postprocess:                      # defaults; spacing/thresholds are SELECTED on validation
-  mode: geometry
-  seg_threshold: 0.5
-  min_validity: 0.3
-  spacing_px: 12.0
+train:
+  monitor: val_monitor              # [v4] select on the uncertainty-free
+                                    # val loss, not the training objective
+  epochs: 80                        # [v2] v1's notebook ran 10 against a default
+                                    # of 60 and stopped while val was still falling
+  early_stop_patience: 15           # [v2] let the curve decide, not the cell
+  batch_size: 4                     # 4 x 384px tiles fits comfortably in 4 GB
+  tile: 384
+  samples_per_image: 40
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 2
+  amp: true                         # mixed precision when CUDA is present
+  init_from: null                   # [v2] checkpoint to fine-tune from
+  max_seconds: 25200                # [v3] 7 h wall-clock budget: stop cleanly
+                                    # between epochs rather than be killed
+                                    # mid-epoch when the runtime is reclaimed.
+                                    # 0 disables.
+
+
+# [v6.6] Inference-only supplement for fibres wider than the learned centre
+# heatmap reliably samples.  The CLI keeps this OFF unless explicitly requested;
+# notebook cell 10 turns it on for new-image measurement.
+thick_recovery:
+  enabled: false
+  min_width_px: 26.0
+  max_width_px: 160.0
+  min_sigma: 8.0
+  spacing_px: 28.0
+  min_ridge_coherence: 0.22
+  segment_support: 0.15
+  sigmas: [1, 2, 3, 4, 6, 8, 12, 16, 24]
+
+# [v2] classical measurements on the ~119 unlabelled fields, used to pretrain
+pseudo:
+  enabled: false                    # set true for the pretraining stage
+  spacing_px: 14.0
+  coherency_min: 0.45
+  min_width_px: 2.5
+  max_width_px: 60.0
+  min_contrast: 0.12
+  confidence: 0.45                  # never 1.0: these are not human measurements
+  max_per_image: 3000
+  calibrate_to_manual: true         # fit only on the current training fold
+  calibration_strict: true          # publication gate: fail, do not merely warn
+  min_calibration_images: 2         # at least two common manual/pseudo fields
+  max_ratio_range_fraction: 0.25    # reject a non-transferable global scalar
+
+postprocess:
+  peak_threshold: 0.30              # tune this on val with evaluate.tune_threshold
+  nms_radius: 7
+  duplicate_radius: 0.9             # in units of predicted width
+  duplicate_angle_deg: 25.0         # only suppress if orientation ALSO agrees
   min_width_px: 2.0
   max_width_px: 200.0
-  boundary_tol: 0.35
-  border_px: 6
-  peak_threshold: 0.3             # baseline mode only
-  nms_radius: 7                   # baseline mode only
+  min_validity: 0.3
 
-selection:                        # validation-only selection
-  objective: fiber_wasserstein_relative
-  min_recall_frac: 0.85
-  spacing_grid: [8.0, 12.0, 16.0, 24.0]
-  validity_grid: [0.0, 0.2, 0.4]
-  seg_grid: [0.4, 0.5, 0.6]
+match:
+  max_center_distance: 12.0
+  use_angle: true
+  angle_weight: 0.15
+  max_angle_deg: 45.0
 
+# [v2] fiber-level evaluation. Chord-to-chord recall asks whether the model
+# reproduced the exact points an annotator happened to pick, which is not the
+# question. These ask whether it found the fibers and recovered the width
+# distribution.
 evaluate:
-  match_distance_scale: 1.5
-  match_min_distance_px: 8.0
-  match_max_angle_deg: 30.0
-  bootstrap: 1000
-  min_groups_for_ci: 5
+  fiber_distance_scale: 1.5         # tolerance in units of the GT width
+  fiber_min_distance_px: 8.0
+  fiber_max_angle_deg: 30.0
+  coverage_radius_px: 12.0
 
-hardware:                         # performance only
-  precision: auto                 # auto | bf16 | fp16 | fp32
-  compile: false
-  train_locally: true
-
-thick_experimental:
-  enabled: false                  # experimental; never pooled unless validated on real GT
-  min_width_px: 18.0
-  max_width_px: 160.0
-  spacing_px: 14.0
-  min_coherence: 0.45
-  validation:
-    min_sites: 30
-    min_precision: 0.7
-    min_recall: 0.5
-    max_median_rel_error: 0.15
-    max_p90_rel_error: 0.2
+output:
+  dir: outputs

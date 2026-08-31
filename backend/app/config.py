@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "sem-fiber"
     s3_region: str = "us-east-1"
-    model_checkpoint: Path = Path("./models/v7/best.pt")
-    model_version: str = "v7.0.0"
+    model_checkpoint: Path = Path("./models/v6_12/best_full.pt")
+    model_version: str = "v6.12"
     model_device: str = "auto"
     work_dir: Path = Path("./work")
     frontend_origin: str = "http://localhost:3000"

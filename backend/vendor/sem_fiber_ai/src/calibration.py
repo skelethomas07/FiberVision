@@ -1,14 +1,3 @@
-"""Physical calibration from the burned-in SEM footer (v7, deduplicated from v6.4).
-
-Routes, in order of authority: manual table entry > sidecar > FOV text > magnification
-constant > scale bar (standard 1-2-5 label, plausible nm/px).  Disputed or unknown
-results are reported as such; the STATUS decision (valid / calibration_invalid) is
-made in :mod:`calib_audit`, which also compares the annotator-implied scale and is
-the only place that may declare a field usable in nanometres.  Nothing here ever
-reads the ground-truth fibre widths.
-"""
-from __future__ import annotations
-
 """Pixel-size (nm/px) resolution with explicit provenance and no silent defaults.
 
 Resolution order (first hit wins, each records how it was obtained):
@@ -27,15 +16,12 @@ Note on step 3: FOV text describes the *acquired* field.  If the file you hold
 was resized after acquisition, ``nm_per_pixel`` must be computed against the
 current pixel width -- which is what :func:`from_fov_text` does.
 """
+from __future__ import annotations
 
 import json
-
 import re
-
 from dataclasses import dataclass, asdict
-
 from pathlib import Path
-
 from typing import Any
 
 import numpy as np
@@ -44,16 +30,22 @@ from .utils import get_logger
 
 LOG = get_logger(__name__)
 
+# Tesseract reliably confuses a few glyphs in this small burned-in font.
+# "@" and "Q" for "0" are by far the most common, and they silently break the
+# FOV parse, so we try both the raw text and a digit-corrected copy.
 _OCR_DIGIT_FIXES = {"@": "0", "Q": "0", "O0": "00", "l": "1", "|": "1"}
 
+#: a standalone physical length, used for the scale-bar label ("100nm", "0.5um").
+#: mm is excluded on purpose: the only mm value in these footers is the working
+#: distance, which has nothing to do with the scale bar.
 _BAR_RE = re.compile(r"(?<![0-9x\u00d7.])([0-9]+(?:\.[0-9]+)?)\s*(nm|um|\u00b5m|\u03bcm)"
                      r"(?![0-9x\u00d7])", re.IGNORECASE)
 
 _FOV_RE = re.compile(
     r"FOV\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*[x\u00d7]\s*([0-9]+(?:\.[0-9]+)?)\s*"
     r"(nm|um|\u00b5m|mm)", re.IGNORECASE)
-
 _UNIT_TO_NM = {"nm": 1.0, "um": 1000.0, "\u00b5m": 1000.0, "mm": 1e6}
+
 
 @dataclass
 class Calibration:
@@ -81,6 +73,10 @@ class Calibration:
             return np.full_like(np.asarray(nm, dtype=np.float64), np.nan)
         return np.asarray(nm, dtype=np.float64) / self.nm_per_pixel
 
+
+# --------------------------------------------------------------------------- #
+# footer handling
+# --------------------------------------------------------------------------- #
 def detect_footer_row(gray: np.ndarray, *, dark_thresh: float = 30.0,
                       dark_frac: float = 0.55, min_rows: int = 8) -> int | None:
     """Return the first row index of the burned-in black info panel, or None.
@@ -104,10 +100,12 @@ def detect_footer_row(gray: np.ndarray, *, dark_thresh: float = 30.0,
         return None
     return int(row)
 
+
 def strip_footer(gray: np.ndarray) -> tuple[np.ndarray, int | None]:
     """Return (image without footer, footer_row).  Footer row is None if absent."""
     row = detect_footer_row(gray)
     return (gray[:row] if row is not None else gray), row
+
 
 def _ocr_variants(text: str) -> list[str]:
     """The raw OCR string plus a copy with common digit confusions repaired."""
@@ -116,6 +114,7 @@ def _ocr_variants(text: str) -> list[str]:
     for bad, good in _OCR_DIGIT_FIXES.items():
         fixed = fixed.replace(bad, good)
     return [text] if fixed == text else [text, fixed]
+
 
 def from_fov_text(text: str, image_width_px: int) -> tuple[float | None, str]:
     """Parse ``FOV:1280x960nm`` style text into nm/px for a given pixel width."""
@@ -130,6 +129,7 @@ def from_fov_text(text: str, image_width_px: int) -> tuple[float | None, str]:
     if image_width_px <= 0:
         return None, "invalid image width"
     return w / float(image_width_px), f"FOV width {w:g} nm / {image_width_px} px"
+
 
 def read_footer_text(gray: np.ndarray, footer_row: int | None) -> str:
     """OCR the footer strip if pytesseract is installed; '' otherwise."""
@@ -147,6 +147,7 @@ def read_footer_text(gray: np.ndarray, footer_row: int | None) -> str:
     except Exception as exc:  # noqa: BLE001
         LOG.warning("footer OCR failed: %s", exc)
         return ""
+
 
 def scale_bar_nm_from_text(text: str) -> tuple[float | None, str]:
     """Read the printed scale-bar value (e.g. "100nm") out of the footer text.
@@ -167,6 +168,7 @@ def scale_bar_nm_from_text(text: str) -> tuple[float | None, str]:
             if 1.0 <= nm <= 1e5:
                 return nm, f"scale-bar label '{value}{unit}'"
     return None, "no scale-bar value in text"
+
 
 def _v3_detect_scale_bar_px(gray: np.ndarray, footer_row: int | None,
                         *, bright_thresh: float = 200.0,
@@ -192,6 +194,10 @@ def _v3_detect_scale_bar_px(gray: np.ndarray, footer_row: int | None,
             best = max(best, int(runs.max()))
     return best if best >= min_len else None
 
+
+# --------------------------------------------------------------------------- #
+# top-level resolution
+# --------------------------------------------------------------------------- #
 def _v3_resolve_calibration(image_path: str | Path, gray: np.ndarray, *,
                         image_id: str | None = None,
                         override: float | None = None,
@@ -244,8 +250,37 @@ def _v3_resolve_calibration(image_path: str | Path, gray: np.ndarray, *,
                        f"scale_bar_px={bar_px}; footer_ocr={'yes' if text.strip() else 'no'}",
                        footer_row)
 
+
+def load_calibration_table(path: str | Path | None) -> dict[str, float]:
+    """Load ``{image_id: nm_per_pixel}`` from YAML or JSON.  Missing file -> {}."""
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        LOG.warning("calibration table %s not found", p)
+        return {}
+    if p.suffix.lower() in (".yaml", ".yml"):
+        import yaml
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    else:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    return {str(k): float(v) for k, v in data.items()}
+
+
+# ---- v4 ----
+
+
+import re
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .utils import get_logger
+
 LOG = get_logger(__name__)
 
+# "1" reads as "T" or "I" in this font at small sizes; "0" as "@"/"Q"/"O".
 _OCR_DIGIT_FIXES_V4 = {
     "@": "0", "Q": "0", "O": "0", "o": "0",
     "l": "1", "|": "1", "I": "1", "T": "1", "i": "1",
@@ -255,9 +290,12 @@ _OCR_DIGIT_FIXES_V4 = {
 _UNIT_TO_NM = {"nm": 1.0, "um": 1000.0, "\u00b5m": 1000.0, "\u03bcm": 1000.0,
                "mm": 1e6}
 
+# A standalone physical length.  mm excluded: the only mm in these footers is
+# the working distance.
 _BAR_RE_V4 = re.compile(
     r"(?<![0-9x\u00d7.])([0-9]+(?:\.[0-9]+)?)\s*(nm|um|\u00b5m|\u03bcm)"
     r"(?![0-9x\u00d7])", re.IGNORECASE)
+
 
 def _ocr_variants_v4(text: str) -> list[str]:
     """Raw text plus a digit-repaired copy, repairs applied only inside tokens
@@ -280,6 +318,7 @@ def _ocr_variants_v4(text: str) -> list[str]:
     if joined != text:
         out.append(joined)
     return out
+
 
 def detect_scale_bar_box(gray: np.ndarray, footer_row: int | None,
                          *, bright_thresh: float = 200.0,
@@ -321,11 +360,13 @@ def detect_scale_bar_box(gray: np.ndarray, footer_row: int | None,
             best = (x, y, w, h)
     return best
 
+
 def detect_scale_bar_px(gray: np.ndarray, footer_row: int | None,
                         **kw: Any) -> int | None:
     """Backwards-compatible wrapper returning only the bar length in pixels."""
     box = detect_scale_bar_box(gray, footer_row, **kw)
     return box[2] if box else None
+
 
 def _ocr(img: np.ndarray, psm: int, whitelist: str | None) -> str:
     try:
@@ -342,6 +383,7 @@ def _ocr(img: np.ndarray, psm: int, whitelist: str | None) -> str:
         LOG.debug("ocr failed (psm=%s): %s", psm, exc)
         return ""
 
+
 def _prep(crop: np.ndarray, scale: int) -> np.ndarray:
     """Upscale, Otsu-binarise and invert to black-on-white for tesseract."""
     import cv2
@@ -351,7 +393,8 @@ def _prep(crop: np.ndarray, scale: int) -> np.ndarray:
     up = cv2.resize(crop.astype(np.uint8), None, fx=scale, fy=scale,
                     interpolation=cv2.INTER_CUBIC)
     up = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return 255 - up
+    return 255 - up          # SEM footers are white-on-black; tesseract wants the reverse
+
 
 def read_bar_label_nm(gray: np.ndarray, footer_row: int | None,
                       box: tuple[int, int, int, int] | None = None,
@@ -392,6 +435,7 @@ def read_bar_label_nm(gray: np.ndarray, footer_row: int | None,
                                     f"(pad {pad_x}, psm {psm})")
     return None, "bar label unreadable"
 
+
 def read_footer_text_v4(gray: np.ndarray, footer_row: int | None,
                         *, scale: int = 3) -> str:
     """OCR the whole footer strip, upscaled and inverted.
@@ -428,7 +472,215 @@ def crosscheck_fov_vs_bar(fov_nmpp: float | None, bar_nmpp: float | None,
         return f"DISAGREE {100 * rel:.1f}%"
     return f"agree within {100 * rel:.1f}%"
 
+
+def resolve_calibration(image_path, gray, *, image_id=None, override=None,
+                        table=None, scale_bar_nm=None, mag_constant=None):
+    """v4: same resolution order, better step 3/4, plus a cross-check."""
+    import json
+    from pathlib import Path as _P
+
+    image_path = _P(image_path)
+    image_id = image_id or image_path.stem
+    footer_row = detect_footer_row(gray)
+    width = int(gray.shape[1])
+
+    if override is not None:
+        if override <= 0:
+            raise ValueError(f"nm_per_pixel must be > 0, got {override}")
+        return Calibration(image_id, float(override), "override",
+                           "supplied by caller", footer_row)
+
+    if table and image_id in table:
+        return Calibration(image_id, float(table[image_id]), "sidecar",
+                           "project calibration table", footer_row)
+
+    sidecar = image_path.with_suffix(".calib.json")
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+            if "nm_per_pixel" in data:
+                return Calibration(image_id, float(data["nm_per_pixel"]),
+                                   "sidecar", str(sidecar), footer_row)
+            if "fov_width_nm" in data:
+                return Calibration(image_id, float(data["fov_width_nm"]) / width,
+                                   "sidecar", f"{sidecar} fov_width_nm", footer_row)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("bad sidecar %s: %s", sidecar, exc)
+
+    text = read_footer_text_v4(gray, footer_row)
+    fov_nmpp, fov_detail = from_fov_text(text, width)
+    mag, _mag_detail = read_magnification(text)
+    if mag and mag_constant and fov_nmpp is None:
+        # [v4] large-font magnification + a constant fitted from the images
+        # whose FOV string did parse.  Only used when FOV and bar both failed.
+        nmpp_mag = (mag_constant / mag) / float(width)
+        _pending_mag = (nmpp_mag, f"x{mag:g}k via fitted constant {mag_constant:.0f}")
+    else:
+        _pending_mag = (None, "")
+
+    box = detect_scale_bar_box(gray, footer_row)
+    bar_px = box[2] if box else None
+    if scale_bar_nm:
+        bar_nm, bar_detail = float(scale_bar_nm), "supplied by caller"
+    else:
+        bar_nm, bar_detail = read_bar_label_nm(gray, footer_row, box)
+    bar_nmpp = (float(bar_nm) / bar_px) if (bar_px and bar_nm) else None
+
+    agreement = crosscheck_fov_vs_bar(fov_nmpp, bar_nmpp, image_id)
+
+    if fov_nmpp is not None:
+        return Calibration(image_id, float(fov_nmpp), "fov_text",
+                           f"{fov_detail}; {agreement}", footer_row)
+    if bar_nmpp is not None:
+        return Calibration(image_id, float(bar_nmpp), "scale_bar",
+                           f"{bar_nm:g} nm / {bar_px} px ({bar_detail})",
+                           footer_row)
+
+    if _pending_mag[0] is not None:
+        return Calibration(image_id, float(_pending_mag[0]), "magnification",
+                           _pending_mag[1], footer_row)
+
+    LOG.warning("%s: pixel size UNKNOWN (bar_px=%s, footer_text=%s, %s)",
+                image_id, bar_px, bool(text.strip()), bar_detail)
+    return Calibration(image_id, None, "unknown",
+                       f"bar_px={bar_px}; {bar_detail}; "
+                       f"footer_ocr={'yes' if text.strip() else 'no'}",
+                       footer_row)
+
+
+def calibrate_all(image_dir, out_yaml="calibration.yaml", *,
+                  pattern=("*.tif", "*.tiff", "*.png", "*.jpg", "*.bmp"),
+                  overwrite=False, existing=None):
+    """Resolve nm/px for every image in a folder and write calibration.yaml.
+
+    Pay the OCR cost once.  Entries already present in the table are kept unless
+    ``overwrite`` is set -- a number you typed by hand is better evidence than a
+    number tesseract guessed, and this will not quietly replace it.
+
+    Returns a DataFrame with one row per image: id, nm_per_pixel, source,
+    detail.  Read the ``source`` column before believing any nanometre.
+    """
+    from pathlib import Path as _P
+
+    import pandas as pd
+    import yaml
+
+    from .utils import read_gray
+
+    image_dir = _P(image_dir)
+    files = sorted({p for pat in pattern for p in image_dir.rglob(pat)})
+    if not files:
+        LOG.warning("no images under %s", image_dir)
+        return pd.DataFrame(columns=["image_id", "nm_per_pixel", "source", "detail"])
+
+    known = dict(existing or {})
+    if not known and _P(out_yaml).exists():
+        known = {str(k): v for k, v in
+                 (yaml.safe_load(_P(out_yaml).read_text(encoding="utf-8")) or {}).items()
+                 if v is not None}
+
+    rows = []
+    for i, p in enumerate(files, 1):
+        iid = p.stem
+        if iid in known and not overwrite:
+            rows.append({"image_id": iid, "nm_per_pixel": float(known[iid]),
+                         "source": "existing", "detail": "kept from table"})
+            continue
+        try:
+            gray = read_gray(p)
+        except Exception as exc:  # noqa: BLE001
+            rows.append({"image_id": iid, "nm_per_pixel": None,
+                         "source": "unreadable", "detail": str(exc)})
+            continue
+        c = resolve_calibration(p, gray, image_id=iid)
+        text = read_footer_text_v4(gray, detect_footer_row(gray))
+        mag, _ = read_magnification(text)
+        fovw = (c.nm_per_pixel * gray.shape[1]) if c.source == "fov_text" else None
+        rows.append({"image_id": iid, "nm_per_pixel": c.nm_per_pixel,
+                     "source": c.source, "detail": c.detail,
+                     "magnification": mag, "fov_width_nm": fovw,
+                     "_path": str(p)})
+        if i % 25 == 0:
+            LOG.info("calibrated %d/%d", i, len(files))
+
+    # second pass: fit FOV_nm x mag from the resolved images and use it on the
+    # ones where both FOV and bar failed.  Nothing is overwritten -- this only
+    # fills nulls.
+    # Fit PER PREFIX GROUP first, then fall back to a folder-wide constant.
+    # A folder holding two instruments (or two export widths) has no single
+    # constant, and fitting one across the lot would either be refused -- losing
+    # the groups that are internally consistent -- or, worse, average them.
+    def _group(iid):
+        for sep in ("_", "-"):
+            if sep in iid:
+                return iid.split(sep)[0]
+        return iid
+
+    groups = {}
+    for r in rows:
+        groups.setdefault(_group(r["image_id"]), []).append(r)
+
+    global_k, global_note = fit_magnification_constant(rows)
+    n_filled = 0
+    for gname, grows in sorted(groups.items()):
+        k, note = fit_magnification_constant(grows)
+        if k:
+            note = f"group '{gname}': {note}"
+        else:
+            k, note = global_k, (f"group '{gname}' had no constant of its own; "
+                                 f"folder-wide {global_note}" if global_k else "")
+        if not k:
+            continue
+        for r in grows:
+            if r["nm_per_pixel"] is not None or not r.get("magnification"):
+                continue
+            try:
+                gray = read_gray(r["_path"])
+            except Exception:  # noqa: BLE001
+                continue
+            r["nm_per_pixel"] = (k / r["magnification"]) / gray.shape[1]
+            r["source"] = "magnification"
+            r["detail"] = f"x{r['magnification']:g}k; {note}"
+            n_filled += 1
+    LOG.info("magnification route filled %d field(s)", n_filled)
+
+    df = pd.DataFrame(rows).drop(columns=["_path"])
+    df = df.sort_values("image_id").reset_index(drop=True)
+    table = {r.image_id: (float(r.nm_per_pixel) if r.nm_per_pixel is not None
+                          and np.isfinite(r.nm_per_pixel) else None)
+             for r in df.itertuples()}
+    _P(out_yaml).write_text(
+        "# written by calibrate_all(); null means UNKNOWN, fill it in by hand.\n"
+        "# Anything you type here wins over OCR on the next run.\n"
+        + yaml.safe_dump(table, sort_keys=True, allow_unicode=True),
+        encoding="utf-8")
+    got = int(df.nm_per_pixel.notna().sum())
+    LOG.info("calibration: %d/%d resolved -> %s", got, len(df), out_yaml)
+    LOG.info("by source: %s", df.source.value_counts().to_dict())
+    return df
+
+
 _MAG_RE = re.compile(r"[x\u00d7]\s*([0-9]+(?:\.[0-9]+)?)\s*k\b", re.IGNORECASE)
+
+
+def read_magnification(text: str) -> tuple[float | None, str]:
+    """Parse the magnification token (e.g. ``x50.0k``) out of footer text.
+
+    It is set in the same large font as the kV/WD line, so it survives OCR on
+    images where the small scale-bar label does not.  On its own it is not a
+    pixel size -- see :func:`fit_magnification_constant`.
+    """
+    for variant in _ocr_variants_v4(text):
+        m = _MAG_RE.search(variant)
+        if m:
+            try:
+                mag = float(m.group(1))
+            except ValueError:
+                continue
+            if 0.1 <= mag <= 1e4:
+                return mag, f"magnification x{mag:g}k"
+    return None, "no magnification in text"
+
 
 def fit_magnification_constant(rows) -> tuple[float | None, str]:
     """Fit ``FOV_width_nm x magnification_k`` from images where FOV parsed.
@@ -462,10 +714,44 @@ def fit_magnification_constant(rows) -> tuple[float | None, str]:
              med, len(ks), 100 * spread)
     return med, f"fitted from {len(ks)} image(s), spread {100 * spread:.2f}%"
 
+# --------------------------------------------------------------------------- #
+# ---- v6.4 -----------------------------------------------------------------
+#
+# Why this block exists.  The v6.3 run resolved 87 of 117 pixel sizes from the
+# scale bar, and several of those were nonsense: B_4 and B_5 read their bar
+# label as "1nm" over a 160 px bar and produced 0.00625 nm/px, which put six
+# training fields at a median fibre width of 0.047 nm.  Four more fields showed
+# the FOV route and the bar route 90-95% apart and the code only warned.
+#
+# Three changes, in order of how much they matter:
+#
+#   1. The bar can no longer ORIGINATE a pixel size unless its OCR'd label is
+#      one of the standard 1-2-5 bar values AND the resulting nm/px is
+#      physically plausible.  "71nm" is not a bar anyone prints; "1nm" is, but
+#      1 nm over 160 px is finer than the microscope resolves.
+#   2. The magnification token becomes a first-class route.  It is set in the
+#      same large font as the kV/WD line, so it survives OCR where the small bar
+#      label does not -- but v6.3 could not read it, because the digit repair
+#      table was only applied to tokens ending in nm/um, so "x10@k" never became
+#      "x100k".  With that fixed, FOV_nm x mag_k = 128000 turns the magnification
+#      into a pixel size for every field whose FOV string failed.
+#   3. Disagreements are arbitrated instead of warned about.  When FOV and bar
+#      disagree, the magnification route breaks the tie; when it cannot, the
+#      field is marked disputed and excluded from nanometre reporting rather
+#      than silently taking one of them.
+#
+# The footer OCR is also memoised on disk, because cell 3 and cell 3c were each
+# paying nine minutes for the same reads.
+# --------------------------------------------------------------------------- #
+
+#: Values a microscope actually prints on a scale bar: 1-2-5 per decade.
 STANDARD_BAR_NM: tuple[float, ...] = tuple(
     float(m) * (10.0 ** e) for e in range(0, 6) for m in (1, 2, 5)
 )
 
+#: Hard plausibility bounds on nm/px for a field-emission SEM micrograph.
+#: 0.1 nm/px is below the resolution of any instrument that produced these
+#: images; 5000 nm/px is a 6.4 mm field.  Anything outside is an OCR artefact.
 PLAUSIBLE_NMPP: tuple[float, float] = (0.1, 5000.0)
 
 _DIGIT_FIX_V64 = {
@@ -474,13 +760,16 @@ _DIGIT_FIX_V64 = {
     "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2", "g": "9", "G": "6",
 }
 
+#: magnification token, tolerant of the glyph confusions above INSIDE the number
 _MAG_TOKEN_RE_V64 = re.compile(
     r"[x\u00d7\u00d7X]\s*([0-9@QODolIiTS sBZzgG.!|]{1,7}?)\s*[kK]\b")
+
 
 def _fix_digits_v64(s: str) -> str:
     for bad, good in _DIGIT_FIX_V64.items():
         s = s.replace(bad, good)
     return s
+
 
 def read_magnification(text: str) -> tuple[float | None, str]:
     """Parse ``x50.0k`` out of footer text, repairing OCR digit confusions.
@@ -503,6 +792,7 @@ def read_magnification(text: str) -> tuple[float | None, str]:
             if 0.1 <= mag <= 1e4:
                 return mag, f"magnification x{mag:g}k"
     return None, "no magnification in text"
+
 
 def snap_bar_nm(bar_px: float, nmpp_estimate: float, *, tol: float = 0.15
                 ) -> tuple[float | None, float]:
@@ -528,8 +818,10 @@ def snap_bar_nm(bar_px: float, nmpp_estimate: float, *, tol: float = 0.15
             best, best_rel = v, rel
     return (best, best_rel) if best_rel <= tol else (None, best_rel)
 
+
 def _is_standard_bar_nm(nm: float, *, tol: float = 1e-6) -> bool:
     return any(abs(nm - v) <= tol * max(v, 1.0) for v in STANDARD_BAR_NM)
+
 
 def bar_label_candidates(gray, footer_row, box=None, *, scale: int = 6
                          ) -> list[tuple[float, str]]:
@@ -568,14 +860,19 @@ def bar_label_candidates(gray, footer_row, box=None, *, scale: int = 6
                                         f"(pad {pad_x}, psm {psm})"))
     return out
 
-_FOOTER_CACHE_PATH = Path("outputs/_footer_ocr_cache.json")
 
+# --------------------------------------------------------------------------- #
+# footer OCR memo -- cell 3 and cell 3c were paying for the same reads twice
+# --------------------------------------------------------------------------- #
+_FOOTER_CACHE_PATH = Path("outputs/_footer_ocr_cache.json")
 _footer_cache: dict[str, Any] | None = None
+
 
 def _footer_key(strip) -> str:
     import hashlib
     a = np.ascontiguousarray(strip)
     return hashlib.md5(a.tobytes()).hexdigest() + f"_{a.shape[0]}x{a.shape[1]}"
+
 
 def _footer_cache_load() -> dict[str, Any]:
     global _footer_cache
@@ -587,6 +884,7 @@ def _footer_cache_load() -> dict[str, Any]:
             _footer_cache = {}
     return _footer_cache
 
+
 def footer_cache_save() -> None:
     if _footer_cache is None:
         return
@@ -595,6 +893,7 @@ def footer_cache_save() -> None:
         _FOOTER_CACHE_PATH.write_text(json.dumps(_footer_cache), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
         LOG.debug("could not save footer cache: %s", exc)
+
 
 def read_footer_all(gray, footer_row) -> dict[str, Any]:
     """Everything readable from the footer, computed once and memoised.
@@ -619,9 +918,14 @@ def read_footer_all(gray, footer_row) -> dict[str, Any]:
     cache[key] = rec
     return rec
 
+
+# --------------------------------------------------------------------------- #
+# resolution
+# --------------------------------------------------------------------------- #
 def _plausible(nmpp) -> bool:
     return (nmpp is not None and np.isfinite(nmpp)
             and PLAUSIBLE_NMPP[0] <= nmpp <= PLAUSIBLE_NMPP[1])
+
 
 def resolve_calibration(image_path, gray, *, image_id=None, override=None,
                         table=None, scale_bar_nm=None, mag_constant=None,
@@ -780,6 +1084,7 @@ def resolve_calibration(image_path, gray, *, image_id=None, override=None,
     return Calibration(image_id, None, "unknown",
                        f"bar_px={bar_px}; mag={mag}; {bar_detail}", footer_row)
 
+
 def calibrate_all(image_dir, out_yaml="calibration.yaml", *,
                   pattern=("*.tif", "*.tiff", "*.png", "*.jpg", "*.bmp"),
                   overwrite=False, existing=None, report_csv=None):
@@ -881,7 +1186,7 @@ def calibrate_all(image_dir, out_yaml="calibration.yaml", *,
                           and r.source != "fov_text_disputed" else None)
              for r in df.itertuples()}
     _P(out_yaml).write_text(
-        "# written by calibrate_all(); null means UNKNOWN or DISPUTED.\n"
+        "# written by calibrate_all() [v6.4]; null means UNKNOWN or DISPUTED.\n"
         "# Type a number here and it wins over OCR on every later run.\n"
         + yaml.safe_dump(table, sort_keys=True, allow_unicode=True),
         encoding="utf-8")
@@ -889,13 +1194,15 @@ def calibrate_all(image_dir, out_yaml="calibration.yaml", *,
         _P(report_csv).parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(report_csv, index=False)
     got = int(sum(v is not None for v in table.values()))
-    LOG.info("calibration: %d/%d usable -> %s", got, len(df), out_yaml)
+    LOG.info("calibration [v6.4]: %d/%d usable -> %s", got, len(df), out_yaml)
     LOG.info("by source: %s", df.source.value_counts().to_dict())
     if disputed:
         LOG.error("DISPUTED (excluded from nm reporting until you fill them in): %s",
                   disputed)
     return df
 
+
+# ---- v6.4h ----
 def load_calibration_table(path):
     """{image_id: nm_per_pixel} from YAML or JSON, skipping unusable entries.
 

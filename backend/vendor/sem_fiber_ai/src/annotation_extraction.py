@@ -39,9 +39,6 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .coords import (IMAGEJ, RASTER, chord_endpoints, fiber_angle_from_measurement,
-                     imagej_to_raster, measurement_angle_from_endpoints,
-                     structure_tensor_orientation, to_raster, wrap180)
 from .utils import (Rect, angle_to_direction, angular_diff_180, ensure_dir,
                     get_logger, line_endpoints, read_gray, read_rgb, wrap_deg_180)
 
@@ -254,10 +251,8 @@ def match_segments_to_csv(segments: Sequence[Segment], lengths: np.ndarray,
     seg_len = np.array([s.length_px for s in segments])
     seg_ang = np.array([s.angle_deg for s in segments])
     csv_len = np.asarray(lengths, float) * float(scale)
-    # [v7] ``angles`` must ALREADY be raster (converted once with the fixed
-    # ImageJ -> raster rule by the caller).  ``y_sign`` is kept only so the
-    # opposite-sign match quality can be reported as a diagnostic; it is never
-    # searched over to choose a convention.
+    # y_sign = +1 when the table's angles are already in raster orientation,
+    # -1 when they use the mathematical y-up convention that ImageJ documents
     csv_ang = np.asarray(angles, float) * float(y_sign)
 
     d_len = np.abs(seg_len[:, None] - csv_len[None, :])
@@ -387,21 +382,18 @@ def infer_scale_from_segments(segments: Sequence[Segment], lengths: np.ndarray,
     grid = np.unique(np.concatenate([
         guess * np.linspace(1.0 / span, span, n_grid), [1.0]]))
     best = None
-    for upp in grid:                     # [v7] angles are raster already; no sign search
-        _idx, diag = match_segments_to_csv(segments, lengths, angles,
-                                           scale=1.0 / float(upp), y_sign=1.0)
-        if not diag["n_matched"]:
-            continue
-        resid = diag["median_length_residual_px"] or 1e9
-        score = diag["n_matched"] / (1.0 + resid)
-        if best is None or score > best["score"]:
-            best = {"units_per_pixel": float(upp), "y_sign": 1.0,
-                    "score": float(score), **diag}
-    if best is not None:
-        # diagnostic only: how well would the MIRRORED convention have matched?
-        _i2, d2 = match_segments_to_csv(segments, lengths, angles,
-                                        scale=1.0 / best["units_per_pixel"], y_sign=-1.0)
-        best["n_matched_if_sign_flipped"] = int(d2.get("n_matched", 0))
+    for y_sign in (1.0, -1.0):
+        for upp in grid:
+            _idx, diag = match_segments_to_csv(segments, lengths, angles,
+                                               scale=1.0 / float(upp),
+                                               y_sign=y_sign)
+            if not diag["n_matched"]:
+                continue
+            resid = diag["median_length_residual_px"] or 1e9
+            score = diag["n_matched"] / (1.0 + resid)
+            if best is None or score > best["score"]:
+                best = {"units_per_pixel": float(upp), "y_sign": y_sign,
+                        "score": float(score), **diag}
     if best is None:
         return {"ok": False, "reason": "no scale matched"}
     best["ok"] = True
@@ -430,10 +422,12 @@ def infer_units_from_segments(segments: Sequence[Segment], lengths: np.ndarray,
             trials.append({"units": units, "ok": False,
                            "reason": "no calibration available"})
             continue
-        # [v7] angles are raster already (fixed conversion); only the units vary
-        _idx, diag = match_segments_to_csv(segments, lengths, angles,
-                                           scale=scale, y_sign=1.0)
-        trials.append({"units": units, "ok": True, "scale": scale, **diag})
+        # the angle sign convention is unknown too, so test both: a wrong sign
+        # mirrors every chord and destroys the match, which makes it easy to see
+        for y_sign in (1.0, -1.0):
+            _idx, diag = match_segments_to_csv(segments, lengths, angles,
+                                               scale=scale, y_sign=y_sign)
+            trials.append({"units": units, "ok": True, "scale": scale, **diag})
     viable = [t for t in trials if t.get("ok") and t.get("n_matched")]
     if not viable:
         return {"best": None, "candidates": trials}
@@ -1054,7 +1048,7 @@ def calibrate_marker_geometry(gray: np.ndarray, cx: np.ndarray, cy: np.ndarray,
                               angle_deg: np.ndarray, width_px: np.ndarray, *,
                               search: float = 10.0, step: float = 1.0,
                               asymmetry_weight: float = 2.5,
-                              y_signs: tuple[float, ...] = (1.0,)
+                              y_signs: tuple[float, ...] = (1.0, -1.0)
                               ) -> dict[str, Any]:
     """Determine, from the image itself, what the marker and angle actually mean.
 
@@ -1264,7 +1258,13 @@ def infer_length_units(gray_original: np.ndarray, cx: np.ndarray, cy: np.ndarray
     return {"best": best, "margin": float(margin), "candidates": results}
 
 
-from .labels import LABEL_COLUMNS as LABELS_COLUMNS  # v7 schema (raster convention)
+LABELS_COLUMNS = [
+    "image_id", "annotation_id", "center_x_px", "center_y_px",
+    "x1_px", "y1_px", "x2_px", "y2_px",
+    "measurement_angle_deg", "local_fiber_angle_deg",
+    "width_px", "width_nm", "nm_per_pixel",
+    "annotation_confidence", "ambiguous_crossing", "source_csv", "is_negative",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -1326,36 +1326,6 @@ def _pair_inputs(original_dir: Path | None, annotated_dir: Path, csv_dir: Path
 
 
 
-def refine_annotator_scale(segments: Sequence[Segment], lengths: np.ndarray,
-                           idx: np.ndarray, *, min_pairs: int = 15,
-                           max_rel_ci: float = 0.15) -> dict[str, Any]:
-    """Annotator units-per-pixel as the Theil-Sen SLOPE of table length vs
-    drawn length, with an intercept absorbing the constant drawn-length
-    offset (stroke caps / detection shorten every chord by about a pixel).
-
-    ``L_table = upp * (L_drawn + delta)`` gives slope ``upp`` and intercept
-    ``upp * delta``; a plain median ratio would carry ``delta`` into the
-    scale.  Falls back (``ok=False``) when the pairs are too few or the
-    width spread is too small for a stable slope.
-    """
-    from scipy import stats
-
-    d = np.array([s.length_px for s, j in zip(segments, idx) if j >= 0], float)
-    c = np.array([lengths[j] for j in idx if j >= 0], float)
-    ok = np.isfinite(d) & np.isfinite(c) & (d > 0) & (c > 0)
-    d, c = d[ok], c[ok]
-    if d.size < min_pairs or np.ptp(d) < 6.0:
-        return {"ok": False, "reason": f"{d.size} pairs, spread {np.ptp(d) if d.size else 0:.1f} px",
-                "n_pairs": int(d.size)}
-    slope, intercept, lo, hi = stats.theilslopes(c, d)
-    if slope <= 0 or (hi - lo) / slope > max_rel_ci:
-        return {"ok": False, "reason": f"slope CI too wide ({lo:.3f}, {hi:.3f})",
-                "n_pairs": int(d.size), "slope": float(slope)}
-    return {"ok": True, "units_per_pixel": float(slope), "ci95": [float(lo), float(hi)],
-            "drawn_length_offset_px": float(intercept / slope), "n_pairs": int(d.size),
-            "method": "theil_sen_with_intercept"}
-
-
 def choose_line_overlay(candidates: Sequence[Path], *,
                         lengths: np.ndarray | None = None,
                         angles: np.ndarray | None = None,
@@ -1387,13 +1357,12 @@ def choose_line_overlay(candidates: Sequence[Path], *,
             score = (len(segs), 0.0)
             report: dict[str, Any] = {}
         else:
-            # [v7] free-scale geometric fit (the annotator's own units per pixel);
-            # angles must already be raster.  No physical calibration is involved.
-            fit = infer_scale_from_segments(segs, lengths, angles)
-            report = {"best": fit if fit.get("ok") else None, "scale_fit": fit}
-            if not fit.get("ok"):
+            report = infer_units_from_segments(segs, lengths, angles,
+                                               nm_per_pixel=nm_per_pixel)
+            b = report.get("best")
+            if not b:
                 continue
-            score = (fit["n_matched"], -(fit["median_length_residual_px"] or 1e9))
+            score = (b["n_matched"], -(b["median_length_residual_px"] or 1e9))
         if score > best_score:
             best_score = score
             best = (path, segs, stroke, report)
@@ -1417,7 +1386,6 @@ def extract_one(image_id: str, annotated: Path, csv_path: Path | None,
                 crossing_max_deg: float = 40.0,
                 y_sign_default: float = 1.0,
                 length_units: str = "auto",
-                csv_angle_convention: str = IMAGEJ,
                 debug_dir: Path | None = None) -> dict[str, Any]:
     """Recover all annotations for one image.  Returns a record with a DataFrame."""
     import pandas as pd
@@ -1484,61 +1452,15 @@ def extract_one(image_id: str, annotated: Path, csv_path: Path | None,
                            1.0, 1.0, 0.0, (0.0, 0.0), True,
                            "clean image reconstructed from the overlay itself")
 
-    nm_per_px = calib.nm_per_pixel if calib.known else None      # PHYSICAL only
+    nm_per_px = calib.nm_per_pixel if calib.known else None
     reg_scale = float(reg.scale) if reg.ok else 1.0
-    if csv_angle_convention not in (IMAGEJ, RASTER):
-        raise ValueError(f"csv_angle_convention must be {IMAGEJ!r} or {RASTER!r}")
 
-    # [v7] ONE fixed conversion of the table's angle column into raster degrees.
-    # Nothing below fits a sign or an offset per field.
-    csv_ang_src = csv_df["angle"].to_numpy(float)
-    csv_ang_raster = np.asarray(to_raster(csv_ang_src, csv_angle_convention), float)
-    csv_df = csv_df.assign(angle_raster=csv_ang_raster)
-
-    def _row_record(label, cx, cy, meas_raster, width_px, *, source_angle, extraction_path,
-                    conf=1.0, is_negative=False, annotator_upp=np.nan, width_px_drawn=np.nan,
-                    source_len=np.nan, units_str="unknown", endpoints=None):
-        meas_raster = float(wrap180(meas_raster)) if np.isfinite(meas_raster) else np.nan
-        if endpoints is None:
-            if np.isfinite(meas_raster):
-                x1, y1, x2, y2 = chord_endpoints(cx, cy, meas_raster, width_px)
-            else:
-                x1 = y1 = x2 = y2 = np.nan
-        else:
-            x1, y1, x2, y2 = endpoints
-            meas_raster = float(measurement_angle_from_endpoints(x1, y1, x2, y2))
-        fib = float(fiber_angle_from_measurement(meas_raster)) if np.isfinite(meas_raster) else np.nan
-        return {
-            "image_id": image_id, "annotation_id": int(label),
-            "center_x_px": float(cx), "center_y_px": float(cy),
-            "x1_px": float(x1), "y1_px": float(y1), "x2_px": float(x2), "y2_px": float(y2),
-            "measurement_angle_raster_deg": meas_raster, "fiber_angle_raster_deg": fib,
-            "width_px": float(width_px), "width_nm": np.nan, "nm_per_pixel": np.nan,
-            "calibration_status": "unaudited", "calibration_valid": False,
-            "source_angle_deg": float(source_angle) if np.isfinite(source_angle) else np.nan,
-            "angle_source_convention": csv_angle_convention,
-            "imagej_angle_deg": (float(source_angle) if (csv_angle_convention == IMAGEJ
-                                 and np.isfinite(source_angle)) else np.nan),
-            "angle_convention_residual_deg": np.nan,
-            "source_length": float(source_len), "source_length_units": units_str,
-            "annotator_units_per_px": float(annotator_upp), "width_px_drawn": float(width_px_drawn),
-            "tensor_fiber_angle_raster_deg": np.nan, "orientation_coherence": np.nan,
-            "chord_vs_tensor_deg": np.nan,
-            "annotation_confidence": float(conf), "ambiguous_crossing": False,
-            "is_negative": bool(is_negative), "extraction_path": extraction_path,
-            "source_csv": str(csv_path),
-        }
-
-    line_report: dict[str, Any] = {"used": False}
-    scale_report: dict[str, Any] = {}
-    units_report: dict[str, Any] = {}
-    geom: dict[str, Any] = {"ok": False}
-    units = length_units
-    annotator_upp = np.nan
-    order_report = {"applied": False, "reason": ""}
-    rows: list[dict[str, Any]] = []
-
-    # ---- 3a. the table already carries coordinates ------------------------
+    # ---- 3a. best path of all: the table already carries coordinates -----
+    # When the CSV states where each measurement was made, use it directly.
+    # Matching drawn chords against such a table is strictly worse: the overlay
+    # is rendered from a *different* export (the raw detections, not the
+    # reviewed set), so the two lists need not even be the same length, and
+    # fitting a free scale between mismatched lists finds a spurious optimum.
     if parsed.has_coordinates:
         units = "pixels" if length_units == "auto" else length_units
         keep = csv_df["status"].astype(str).str.lower().ne("rejected") \
@@ -1546,100 +1468,139 @@ def extract_one(image_id: str, annotated: Path, csv_path: Path | None,
         coord_fit = infer_csv_coordinate_scale(
             orig_body, csv_df.loc[keep, "cx"].to_numpy(float),
             csv_df.loc[keep, "cy"].to_numpy(float),
-            csv_df.loc[keep, "angle_raster"].to_numpy(float),
+            csv_df.loc[keep, "angle"].to_numpy(float),
             csv_df.loc[keep, "length"].to_numpy(float))
         coord_scale = float(coord_fit["scale"])
         if not coord_fit.get("ok"):
-            errors.append({"image_id": image_id, "reason": "coordinate_scale_unverified",
+            errors.append({"image_id": image_id,
+                           "reason": "coordinate_scale_unverified",
                            "detail": coord_fit.get("reason", "")})
-        have_ep = {"x1", "y1", "x2", "y2"} <= set(csv_df.columns)
+        rows: list[dict[str, Any]] = []
+        n_rejected = 0
         for label, row in csv_df.iterrows():
             status = str(row.get("status", "")).strip().lower()
             is_negative = status == "rejected"
+            if is_negative:
+                n_rejected += 1
+                errors.append({"image_id": image_id, "label": int(label),
+                               "reason": "rejected_by_reviewer",
+                               "detail": str(row.get("review_label", ""))})
+                # A site a reviewer looked at and refused is not noise to be
+                # dropped -- it is the most informative negative in the dataset,
+                # because it is a place the automatic detector was confident and
+                # wrong.  Keep the geometry, flag it, and let the training code
+                # decide what to do with it.
             mx, my = reg.apply(np.array([float(row["cx"]) * coord_scale]),
                                np.array([float(row["cy"]) * coord_scale]))
             cx, cy = float(mx[0]), float(my[0])
-            L = float(row["length"]) * coord_scale
-            if units == "pixels":
-                width_px = L * reg_scale
+            width_px = float(length_to_original_px(
+                float(row["length"]) * coord_scale, units,
+                reg_scale=reg_scale, nm_per_pixel=nm_per_px))
+            angle = float(row["angle"]) if np.isfinite(row["angle"]) else np.nan
+            if {"x1", "y1", "x2", "y2"} <= set(csv_df.columns):
+                x1, y1 = float(row["x1"]) * coord_scale, float(row["y1"]) * coord_scale
+                x2, y2 = float(row["x2"]) * coord_scale, float(row["y2"]) * coord_scale
             else:
-                width_px = np.nan      # physical lengths without a drawn chord: unusable
-            ep = None
-            if have_ep:
-                ex1, ey1 = reg.apply(np.array([float(row["x1"]) * coord_scale]),
-                                     np.array([float(row["y1"]) * coord_scale]))
-                ex2, ey2 = reg.apply(np.array([float(row["x2"]) * coord_scale]),
-                                     np.array([float(row["y2"]) * coord_scale]))
-                ep = (float(ex1[0]), float(ey1[0]), float(ex2[0]), float(ey2[0]))
-                width_px = float(np.hypot(ep[2] - ep[0], ep[3] - ep[1]))
+                x1, y1, x2, y2 = line_endpoints(cx, cy, angle, width_px,
+                                                y_sign_default)
             conf = row.get("confidence", 1.0)
-            conf = float(conf) if np.isfinite(pd.to_numeric(conf, errors="coerce")) else 1.0
-            rows.append(_row_record(label, cx, cy, float(row["angle_raster"]), width_px,
-                                    source_angle=float(row["angle"]), extraction_path="csv_coordinates",
-                                    conf=conf, is_negative=is_negative, source_len=float(row["length"]),
-                                    units_str=units, endpoints=ep))
+            rows.append({
+                "image_id": image_id, "annotation_id": int(label),
+                "center_x_px": cx, "center_y_px": cy,
+                "x1_px": x1, "y1_px": y1, "x2_px": x2, "y2_px": y2,
+                "measurement_angle_deg": angle,
+                "local_fiber_angle_deg": np.nan,
+                "width_px": width_px,
+                "width_nm": width_px * nm_per_px if nm_per_px else np.nan,
+                "nm_per_pixel": nm_per_px if nm_per_px else np.nan,
+                "annotation_confidence": float(conf) if np.isfinite(
+                    pd.to_numeric(conf, errors="coerce")) else 1.0,
+                "ambiguous_crossing": False,
+                "source_csv": str(csv_path),
+                "is_negative": is_negative,
+            })
         geom = {"ok": True, "source": "csv_coordinates"}
-        units_report = {"best": {"units": units, "source": "csv coordinates"},
-                        "coordinate_scale": {k: v for k, v in coord_fit.items() if k != "trials"}}
+        y_sign = y_sign_default
+        n_exact = sum(1 for r in rows if not r.get("is_negative"))
+        order_report = {"applied": False,
+                        "reason": "not needed (CSV carries coordinates)"}
+        marker_offset = (0.0, 0.0)
         line_report = {"used": False, "reason": "CSV carries coordinates"}
-        n_exact = sum(1 for r in rows if not r["is_negative"])
+        scale_report: dict[str, Any] = {}
+        units_report = {"best": {"units": units, "source": "csv coordinates"},
+                        "coordinate_scale": {k: v for k, v in coord_fit.items()
+                                             if k != "trials"}}
+        df = pd.DataFrame(rows, columns=LABELS_COLUMNS)
+        LOG.info("%s: %d annotations taken straight from the CSV coordinates "
+                 "(+%d reviewer-rejected sites kept as negatives)",
+                 image_id, n_exact, n_rejected)
     else:
-        # ---- 3b. the overlay draws the measurement chords --------------------
+
+        # ---- 3b. fallback: the overlay draws the measurement chords -----------
         csv_len = csv_df["length"].to_numpy(float)
+        csv_ang = csv_df["angle"].to_numpy(float)
         line_path, segments, stroke, u = choose_line_overlay(
-            overlays or [annotated], lengths=csv_len, angles=csv_ang_raster,
-            nm_per_pixel=None)
-        line_report = {"used": False, "n_segments": len(segments)}
+            overlays or [annotated], lengths=csv_len, angles=csv_ang,
+            nm_per_pixel=nm_per_px)
+        scale_report: dict[str, Any] = {}
+        line_report: dict[str, Any] = {"used": False, "n_segments": len(segments)}
         if len(segments) >= max(20, 0.2 * len(csv_df)):
-            # The annotator's own scale: CSV units per OVERLAY pixel, solved from
-            # the drawing itself.  It converts the table's lengths back into the
-            # pixels they were drawn at.  It is provenance -- it is compared with
-            # the physical scale in the audit and NEVER substituted for it.
-            fit = infer_scale_from_segments(segments, csv_len, csv_ang_raster)
-            scale_report = fit
-            if fit.get("ok"):
-                annotator_upp = float(fit["units_per_pixel"])
-                if length_units == "auto":
-                    units = "pixels" if fit["looks_like_pixels"] else "physical"
-                scale = 1.0 / annotator_upp
+            if length_units == "auto":
+                # Solve the pixel size from the drawing itself and prefer it over a
+                # scale bar, which breaks silently on an unfamiliar footer layout.
+                fit = infer_scale_from_segments(segments, csv_len, csv_ang)
+                scale_report = fit
+                if fit.get("ok") and not fit["looks_like_pixels"]:
+                    upp = fit["units_per_pixel"]
+                    # A parsed FOV string is trustworthy; a scale bar read off an
+                    # unfamiliar footer layout is not. Only override the latter.
+                    disagrees = (nm_per_px is None
+                                 or (calib.source != "fov_text"
+                                     and abs(upp - nm_per_px)
+                                     / max(nm_per_px, 1e-9) > 0.15))
+                    if disagrees:
+                        LOG.warning("%s: pixel size from the overlay is %.4f nm/px, "
+                                    "but the footer gave %s (%s) -- using the overlay",
+                                    image_id, upp,
+                                    f"{nm_per_px:.4f}" if nm_per_px else "nothing",
+                                    calib.source)
+                        errors.append({"image_id": image_id,
+                                       "reason": "calibration_overridden_by_overlay",
+                                       "detail": f"footer={nm_per_px} ({calib.source}), "
+                                                 f"overlay={upp:.4f}"})
+                        nm_per_px = float(upp)
+                    units, y_sign_line = "nm", fit["y_sign"]
+                    units_report = {"best": {"units": "nm", "y_sign": fit["y_sign"],
+                                             "source": "overlay scale fit",
+                                             "n_matched": fit["n_matched"],
+                                             "median_length_residual_px":
+                                                 fit["median_length_residual_px"]},
+                                    "scale_fit": fit}
+                else:
+                    u = infer_units_from_segments(segments, csv_len, csv_ang,
+                                                  nm_per_pixel=nm_per_px)
+                    units = u["best"]["units"] if u.get("best") else "pixels"
+                    units_report = u
+                    y_sign_line = (u["best"]["y_sign"] if u.get("best")
+                                   else y_sign_default)
             else:
-                u2 = infer_units_from_segments(segments, csv_len, csv_ang_raster,
-                                               nm_per_pixel=nm_per_px)
-                units_report = u2
-                units = u2["best"]["units"] if u2.get("best") else "pixels"
-                scale = float(u2["best"]["scale"]) if u2.get("best") else 1.0
-                annotator_upp = 1.0 / scale if scale else np.nan
-            idx, diag = match_segments_to_csv(segments, csv_len, csv_ang_raster,
-                                              scale=scale, y_sign=1.0)
-            # [v7] refine the annotator scale with an intercept: the drawn chord
-            # is systematically ~1 px shorter than the table length / scale
-            # (stroke caps, detection), which biases a plain ratio by 5-10 %.
-            refine = refine_annotator_scale(segments, csv_len, idx)
-            scale_report = {**scale_report, "refined": refine}
-            if refine.get("ok"):
-                annotator_upp = float(refine["units_per_pixel"])
-                scale = 1.0 / annotator_upp
-                idx, diag = match_segments_to_csv(segments, csv_len, csv_ang_raster,
-                                                  scale=scale, y_sign=1.0)
-            _i2, diag_flip = match_segments_to_csv(segments, csv_len, csv_ang_raster,
-                                                   scale=scale, y_sign=-1.0)
+                units = length_units
+                y_sign_line = y_sign_default
+            scale = 1.0 if units == "pixels" else (
+                (1000.0 if units == "um" else 1.0) / nm_per_px if nm_per_px else 1.0)
+            idx, diag = match_segments_to_csv(segments, csv_len, csv_ang, scale=scale,
+                                              y_sign=y_sign_line)
             line_report.update(used=True, overlay=str(line_path), stroke_px=stroke,
-                               units=units, annotator_units_per_px=annotator_upp,
-                               n_matched_if_sign_flipped=int(diag_flip.get("n_matched", 0)),
-                               **diag)
-            if diag.get("n_matched", 0) < diag_flip.get("n_matched", 0):
-                errors.append({"image_id": image_id, "reason": "angle_convention_mismatch",
-                               "detail": (f"fixed {csv_angle_convention} conversion matched "
-                                          f"{diag.get('n_matched')} chords but the mirrored "
-                                          f"convention matched {diag_flip.get('n_matched')}; "
-                                          "check the export's angle convention")})
+                               units=units, **diag)
+
             labels_by_pos = list(csv_df.index)
+            rows: list[dict[str, Any]] = []
             seen: set[int] = set()
-            residuals = []
             for seg, j in zip(segments, idx):
                 if j < 0:
                     errors.append({"image_id": image_id, "reason": "chord_unmatched",
-                                   "detail": f"drawn chord at ({seg.cx:.0f}, {seg.cy:.0f}) matched no CSV row"})
+                                   "detail": f"drawn chord at ({seg.cx:.0f}, {seg.cy:.0f}) "
+                                             "matched no CSV row"})
                     continue
                 label = int(labels_by_pos[j])
                 if label in seen:
@@ -1648,140 +1609,171 @@ def extract_one(image_id: str, annotated: Path, csv_path: Path | None,
                 row = csv_df.loc[label]
                 cx, cy = reg.apply(np.array([seg.cx]), np.array([seg.cy]))
                 cx, cy = float(cx[0]), float(cy[0])
-                width_px = float(row["length"]) * scale * reg_scale
-                drawn_px = float(seg.length_px) * reg_scale
-                ang_r = float(row["angle_raster"]) if np.isfinite(row["angle_raster"]) else float(seg.angle_deg)
-                rec = _row_record(label, cx, cy, ang_r, width_px, source_angle=float(row["angle"]),
-                                  extraction_path="line_overlay", annotator_upp=annotator_upp,
-                                  width_px_drawn=drawn_px, source_len=float(row["length"]),
-                                  units_str=units)
-                res = float(angular_diff_180(seg.angle_deg, ang_r))
-                rec["angle_convention_residual_deg"] = res
-                residuals.append(res)
-                rows.append(rec)
+                width_px = float(length_to_original_px(float(row["length"]), units,
+                                                       reg_scale=reg_scale,
+                                                       nm_per_pixel=nm_per_px))
+                angle = float(row["angle"]) if np.isfinite(row["angle"]) else seg.angle_deg
+                x1, y1, x2, y2 = line_endpoints(cx, cy, angle, width_px, y_sign_line)
+                rows.append({
+                    "image_id": image_id, "annotation_id": label,
+                    "center_x_px": cx, "center_y_px": cy,
+                    "x1_px": x1, "y1_px": y1, "x2_px": x2, "y2_px": y2,
+                    "measurement_angle_deg": angle,
+                    "local_fiber_angle_deg": np.nan,
+                    "width_px": width_px,
+                    "width_nm": width_px * nm_per_px if nm_per_px else np.nan,
+                    "nm_per_pixel": nm_per_px if nm_per_px else np.nan,
+                    "annotation_confidence": 1.0,
+                    "ambiguous_crossing": False,
+                    "is_negative": False,
+                    "source_csv": str(csv_path),
+                })
             for missing in sorted(set(csv_df.index) - seen):
                 errors.append({"image_id": image_id, "label": int(missing),
                                "reason": "annotation_not_located",
                                "detail": "CSV row has no drawn chord in the overlay"})
-            line_report["median_angle_convention_residual_deg"] = (
-                float(np.median(residuals)) if residuals else None)
             geom = {"ok": True, "source": "line_overlay"}
+            y_sign = y_sign_line
             n_exact = len(rows)
+            order_report = {"applied": False, "reason": "not needed (chords were drawn)"}
+            marker_offset = (0.0, 0.0)
+            df = pd.DataFrame(rows, columns=LABELS_COLUMNS)
         else:
-            # ---- 4. markers + OCR: positions from markers, angles from the table -----
+            # ---- 4. what do the marker, the angle and the length units mean? -----
             probe_x, probe_y, probe_a, probe_L = [], [], [], []
             for a in assoc:
                 if a.number in csv_df.index:
                     r = csv_df.loc[a.number]
                     probe_x.append(a.x + marker_offset[0])
                     probe_y.append(a.y + marker_offset[1])
-                    probe_a.append(float(r["angle_raster"]))
+                    probe_a.append(float(r["angle"]))
                     probe_L.append(float(r["length"]))
-            probe_x, probe_y = np.asarray(probe_x), np.asarray(probe_y)
-            probe_a, probe_L = np.asarray(probe_a), np.asarray(probe_L)
+            probe_x = np.asarray(probe_x)
+            probe_y = np.asarray(probe_y)
+            probe_a = np.asarray(probe_a)
+            probe_L = np.asarray(probe_L)
+            # probe positions live in overlay coordinates; move them onto the original
             if len(probe_x):
                 probe_x, probe_y = reg.apply(probe_x, probe_y)
+
+            units_report: dict[str, Any] = {}
+            units = length_units
             if auto_geometry and len(probe_x) >= 20:
                 if units == "auto":
                     units_report = infer_length_units(
                         orig_body, probe_x, probe_y, probe_a, probe_L,
                         reg_scale=reg_scale, nm_per_pixel=nm_per_px)
-                    units = units_report["best"]["units"] if units_report.get("best") else "pixels"
-                    if not units_report.get("best"):
+                    if units_report.get("best"):
+                        units = units_report["best"]["units"]
+                    else:
+                        units = "pixels"
                         errors.append({"image_id": image_id, "reason": "units_not_inferred",
-                                       "detail": "defaulting to pixels"})
+                                       "detail": "defaulting to pixels; set "
+                                                 "--length_units explicitly"})
                 probe_w = length_to_original_px(probe_L, units, reg_scale=reg_scale,
                                                 nm_per_pixel=nm_per_px)
-                geom = calibrate_marker_geometry(orig_body, probe_x, probe_y, probe_a, probe_w,
-                                                 y_signs=(1.0,))
+                geom = calibrate_marker_geometry(orig_body, probe_x, probe_y, probe_a,
+                                                 probe_w)
                 if geom.get("ok"):
-                    marker_offset = (marker_offset[0] + geom["dx"], marker_offset[1] + geom["dy"])
+                    marker_offset = (marker_offset[0] + geom["dx"],
+                                     marker_offset[1] + geom["dy"])
+                    y_sign = geom["y_sign"]
+                else:
+                    y_sign = y_sign_default
             else:
                 geom = {"ok": False, "reason": "auto_geometry disabled or too few probes"}
+                y_sign = y_sign_default
                 if units == "auto":
                     units = "pixels"
+
             if units not in LENGTH_UNITS:
                 raise ValueError(f"length_units must be one of {LENGTH_UNITS} or 'auto'")
-            if units in ("nm", "um") and nm_per_px is None:
-                errors.append({"image_id": image_id, "reason": "physical_length_without_calibration",
-                               "detail": "marker-path table is in physical units but no physical "
-                                         "nm/px is known; widths cannot be expressed in pixels"})
+            LOG.info("%s: length units=%s, nm/px=%s, overlay->original scale=%.4f",
+                     image_id, units, f"{nm_per_px:.4f}" if nm_per_px else "unknown",
+                     reg_scale)
+
+            # ---- 5. assemble rows -------------------------------------------------
+            rows: list[dict[str, Any]] = []
             seen: set[int] = set()
             for a in assoc:
                 if a.number not in csv_df.index:
                     errors.append({"image_id": image_id, "label": a.number,
-                                   "reason": "number_not_in_csv", "detail": "read from overlay but absent"})
+                                   "reason": "number_not_in_csv",
+                                   "detail": "read from overlay but absent from the table"})
                     continue
                 seen.add(a.number)
                 row = csv_df.loc[a.number]
                 mx, my = a.x + marker_offset[0], a.y + marker_offset[1]
                 cx, cy = reg.apply(np.array([mx]), np.array([my]))
                 cx, cy = float(cx[0]), float(cy[0])
-                width_px = float(length_to_original_px(float(row["length"]), units,
-                                                       reg_scale=reg_scale, nm_per_pixel=nm_per_px))
-                ang_r = float(row["angle_raster"])
-                if not marker_is_center and np.isfinite(ang_r):
-                    x2, y2, _, _ = chord_endpoints(cx, cy, ang_r, width_px * 2)
+
+                angle = float(row["angle"]) if np.isfinite(row["angle"]) else np.nan
+                length_src = float(row["length"])
+                # One conversion, one place. width_px is always pixels of the ORIGINAL
+                # image (via the overlay->original registration scale when the two
+                # differ), and width_nm is filled only when a calibration exists.
+                width_px = float(length_to_original_px(length_src, units,
+                                                       reg_scale=reg_scale,
+                                                       nm_per_pixel=nm_per_px))
+                width_nm = width_px * nm_per_px if nm_per_px else float("nan")
+
+                if not marker_is_center:
+                    # marker sits at one endpoint: shift by half a width along the line
+                    x2, y2, _, _ = line_endpoints(cx, cy, angle, width_px * 2, y_sign)
                     cx, cy = (cx + x2) / 2.0, (cy + y2) / 2.0
-                conf = float(min(1.0, 0.5 * a.ocr_score
-                                 + 0.5 * (a.marker_score if a.matched_marker else 0.0)))
-                rows.append(_row_record(a.number, cx, cy, ang_r, width_px, source_angle=float(row["angle"]),
-                                        extraction_path="marker_ocr", conf=conf,
-                                        source_len=float(row["length"]), units_str=units))
+
+                x1, y1, x2, y2 = line_endpoints(cx, cy, angle, width_px, y_sign)
+                rows.append({
+                    "image_id": image_id, "annotation_id": int(a.number),
+                    "center_x_px": cx, "center_y_px": cy,
+                    "x1_px": x1, "y1_px": y1, "x2_px": x2, "y2_px": y2,
+                    "measurement_angle_deg": angle,
+                    "local_fiber_angle_deg": np.nan,          # filled below
+                    "width_px": width_px, "width_nm": width_nm,
+                    "nm_per_pixel": calib.nm_per_pixel if calib.known else np.nan,
+                    "is_negative": False,
+                    "annotation_confidence": float(min(1.0, 0.5 * a.ocr_score
+                                                       + 0.5 * (a.marker_score if a.matched_marker else 0.0))),
+                    "ambiguous_crossing": False,
+                    "source_csv": str(csv_path),
+                })
+
             for missing in sorted(set(csv_df.index) - seen):
                 errors.append({"image_id": image_id, "label": int(missing),
                                "reason": "annotation_not_located",
                                "detail": "CSV row has no recoverable marker in the overlay"})
-            n_exact = len(rows)
 
-    from .labels import LABEL_COLUMNS, ensure_schema
-    df = ensure_schema(pd.DataFrame(rows, columns=LABEL_COLUMNS)) if rows else \
-        ensure_schema(pd.DataFrame(columns=LABEL_COLUMNS))
-    df = df[np.isfinite(df["width_px"].to_numpy(float)) & (df["width_px"].to_numpy(float) > 0)] \
-        .reset_index(drop=True)
+            df = pd.DataFrame(rows, columns=LABELS_COLUMNS)
 
-    # ---- 6. structure-tensor fibre orientation: fixed raster mapping, diagnostic only ----
-    orientation_check: dict[str, Any] | None = None
+    # ---- 6. local fiber orientation + crossing flag -----------------------
     if len(df):
         body_valid = np.ones(orig_body.shape, bool)
         if original is None:
             body_valid = ~painted[:orig_body.shape[0], :orig_body.shape[1]]
-        img_t = orig_body.astype(np.float64)
-        if not body_valid.all():
-            img_t = img_t.copy()
-            img_t[~body_valid] = float(np.median(img_t[body_valid])) if body_valid.any() else 0.0
-        t_ang, t_coh = structure_tensor_orientation(img_t / 255.0, sigma=2.0, grad_sigma=1.0)
-        xs = np.clip(np.rint(df["center_x_px"].to_numpy(float)), 0, orig_body.shape[1] - 1).astype(int)
-        ys = np.clip(np.rint(df["center_y_px"].to_numpy(float)), 0, orig_body.shape[0] - 1).astype(int)
-        ta, tc = t_ang[ys, xs].astype(float), t_coh[ys, xs].astype(float)
-        fib = df["fiber_angle_raster_deg"].to_numpy(float)
-        dev = np.asarray(angular_diff_180(fib, ta), float)
-        df["tensor_fiber_angle_raster_deg"] = ta
-        df["orientation_coherence"] = tc
-        df["chord_vs_tensor_deg"] = dev
-        coherent = tc >= max(coherence_min, 0.5)
-        df["ambiguous_crossing"] = (tc >= coherence_min) & (dev > crossing_max_deg)
-        df.loc[~np.isfinite(df["measurement_angle_raster_deg"]), "ambiguous_crossing"] = True
+        # smooth at the scale of the fiber being measured, not a fixed radius
+        sig = np.clip(df["width_px"].to_numpy() / 3.0, 1.0, 8.0)
+        fib_ang, coh = local_fiber_angle(orig_body, df["center_x_px"].to_numpy(),
+                                         df["center_y_px"].to_numpy(),
+                                         sigma=sig, valid=body_valid)
+        # The annotator's chord is the authority on orientation: a fiber runs
+        # perpendicular to the line drawn across it.  The structure tensor is a
+        # cross-check, and only a *coherent* one is worth listening to -- in a
+        # dense network it frequently returns noise, and treating that as fact
+        # would flag most of the dataset as ambiguous and throw it away.
+        conv = resolve_orientation_convention(
+            fib_ang, coh, df["measurement_angle_deg"].to_numpy(),
+            coherence_min=max(coherence_min, 0.5))
+        fib_aligned = wrap_deg_180(conv["sign"] * fib_ang + conv["offset"])
+        df["local_fiber_angle_deg"] = np.where(
+            coh >= coherence_min, fib_aligned,
+            wrap_deg_180(df["measurement_angle_deg"].to_numpy() - 90.0))
+        dev = angular_diff_180(df["measurement_angle_deg"].to_numpy() - 90.0,
+                               fib_aligned)
+        df["ambiguous_crossing"] = (coh >= coherence_min) & (dev > crossing_max_deg)
         if "is_negative" in df.columns:
             df.loc[df["is_negative"].astype(bool), "ambiguous_crossing"] = False
-        if coherent.sum() >= 20:
-            d_ok = dev[coherent]
-            # what the MIRRORED convention would have scored, as a diagnostic
-            mirrored = np.asarray(angular_diff_180(wrap180(-fib[coherent]), ta[coherent]), float)
-            orientation_check = {"n_coherent": int(coherent.sum()),
-                                 "median_chord_vs_tensor_deg": float(np.median(d_ok)),
-                                 "frac_within_30deg": float(np.mean(d_ok < 30.0)),
-                                 "median_if_mirrored_deg": float(np.median(mirrored)),
-                                 "convention_used": csv_angle_convention,
-                                 "fitted": False}
-            if np.median(mirrored) + 5.0 < np.median(d_ok):
-                errors.append({"image_id": image_id, "reason": "angle_convention_mismatch",
-                               "detail": (f"chords vs tensor: {np.median(d_ok):.1f} deg with the fixed "
-                                          f"{csv_angle_convention} conversion, {np.median(mirrored):.1f} "
-                                          "deg if mirrored -- the export may not use that convention")})
-        else:
-            orientation_check = {"n_coherent": int(coherent.sum()), "reason": "too few coherent sites",
-                                 "convention_used": csv_angle_convention, "fitted": False}
+        df.loc[~np.isfinite(df["measurement_angle_deg"]), "ambiguous_crossing"] = True
+        df["orientation_coherence"] = coh
 
     if debug_dir is not None:
         import cv2
@@ -1805,19 +1797,28 @@ def extract_one(image_id: str, annotated: Path, csv_path: Path | None,
         "order_completion": order_report,
         "recovery_rate": float(len(df) / max(1, len(csv_df))),
         "digit_templates_named": sorted(tmpl),
-        "calibration": calib.to_dict(),                 # PHYSICAL route only (footer / table)
-        "physical_nm_per_px": nm_per_px,
-        "annotator_units_per_px": (float(annotator_upp) if np.isfinite(annotator_upp) else None),
-        "length_units": units,
-        "csv_angle_convention": csv_angle_convention,
-        "extraction_path": geom.get("source", "marker_ocr" if geom.get("ok") else "unknown"),
+        "calibration": calib.to_dict(),
+        # [v3] calib.to_dict() is what the FOOTER said. When an overlay scale
+        # fit overrode it, the labels table carries the overlay value and the
+        # meta carried the footer value -- 4b reported 3.125 nm/px for
+        # 40s_48-4 while the widths had been computed at 2.103. Report what was
+        # actually applied, next to what it replaced.
+        "nm_per_pixel_applied": (float(nm_per_px) if nm_per_px else None),
+        "calibration_applied_source": (
+            "overlay_scale_fit"
+            if (nm_per_px is not None and calib.nm_per_pixel is not None
+                and abs(float(nm_per_px) - float(calib.nm_per_pixel))
+                > 1e-6 * max(1.0, abs(float(nm_per_px))))
+            else calib.source),
         "registration": reg.to_dict(),
         "length_quantum": quantum,
         "marker_geometry": {k: v for k, v in geom.items() if k not in ("profile", "t")},
+        "y_sign": y_sign,
+        "length_units": units,
         "length_units_inference": units_report,
         "overlay_to_original_scale": reg_scale,
         "marker_offset": list(marker_offset),
-        "orientation_check": orientation_check,
+        "orientation_convention": conv if len(df) else None,
         "csv_columns": parsed.raw_columns,
         "csv_has_coordinates": parsed.has_coordinates,
         "line_overlay": line_report,
