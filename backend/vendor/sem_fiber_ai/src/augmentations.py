@@ -118,19 +118,34 @@ class GeometricAug:
 
             # angle update: recover it from the transformed endpoints so the
             # matrix is the single source of truth (no duplicated trig)
+            from .coords import (fiber_angle_from_measurement,
+                                 measurement_angle_from_endpoints, transform_angle)
+
             if {"x1_px", "y1_px", "x2_px", "y2_px"} <= set(ann.columns):
                 dx = ann["x2_px"].to_numpy(float) - ann["x1_px"].to_numpy(float)
                 dy = ann["y2_px"].to_numpy(float) - ann["y1_px"].to_numpy(float)
-                ann["measurement_angle_deg"] = np.rad2deg(np.arctan2(dy, dx))
+                meas = measurement_angle_from_endpoints(
+                    ann["x1_px"].to_numpy(float), ann["y1_px"].to_numpy(float),
+                    ann["x2_px"].to_numpy(float), ann["y2_px"].to_numpy(float))
+                ann["measurement_angle_deg"] = meas          # legacy column: raster now
+                ann["measurement_angle_raster_deg"] = meas
+                ann["fiber_angle_raster_deg"] = fiber_angle_from_measurement(meas)
                 ann["width_px"] = np.hypot(dx, dy)
             else:
                 ann["width_px"] = ann["width_px"].to_numpy(float) * scale
+                for col in ("measurement_angle_deg", "measurement_angle_raster_deg",
+                            "fiber_angle_raster_deg"):
+                    if col in ann.columns:
+                        ann[col] = transform_angle(M, ann[col].to_numpy(float))
 
-            if "local_fiber_angle_deg" in ann.columns:
-                # a similarity transform rotates directions by its own rotation
-                rot = np.rad2deg(np.arctan2(M[1, 0], M[0, 0]))
-                ann["local_fiber_angle_deg"] = wrap_deg_180(
-                    ann["local_fiber_angle_deg"].to_numpy(float) + rot)
+            # [v7] a direction transforms by the LINEAR PART of the matrix, which
+            # is correct for reflections too.  v6 added the rotation angle of
+            # the matrix, which is wrong under hflip/vflip (theta -> -theta).
+            for col in ("local_fiber_angle_deg", "tensor_fiber_angle_raster_deg"):
+                if col in ann.columns:
+                    ann[col] = transform_angle(M, ann[col].to_numpy(float))
+            if "angle_source_convention" in ann.columns:
+                ann["angle_source_convention"] = "raster_y_down"   # after any warp
 
             if "nm_per_pixel" in ann.columns:
                 # pixels changed size, so nm/px must follow or widths in nm break

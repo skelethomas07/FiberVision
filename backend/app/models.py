@@ -50,7 +50,7 @@ class AnalysisJob(Base):
     status: Mapped[AnalysisStatus] = mapped_column(String(32), default=AnalysisStatus.QUEUED)
     progress: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    model_version: Mapped[str] = mapped_column(String(100), default="v6.11")
+    model_version: Mapped[str] = mapped_column(String(100), default="v7.0.0")
     summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

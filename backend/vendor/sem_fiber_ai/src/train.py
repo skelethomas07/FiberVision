@@ -1,489 +1,402 @@
-"""Training entry point for both the baseline and the full-image model.
+"""Training (v7): the scientific protocol is fixed; hardware only changes speed.
 
-Everything needed to reproduce a run is written next to the checkpoint: the
-resolved config, the seed, package versions, and the exact split assignment.
+``RUN_MODE``:
+
+``FULL_RUN``          requires CUDA.  Uses the protocol in ``cfg['protocol']``
+                      unchanged.  If CUDA is missing it STOPS.
+``FAST_SMOKE_TEST``   a separately declared, deliberately tiny protocol
+                      (``cfg['smoke_protocol']``) that runs on CPU to prove the
+                      code path works.  Its outputs are labelled ``smoke`` and are
+                      never scientific results.
+
+Everything hardware-dependent (micro-batch, accumulation, precision, workers)
+is decided in :mod:`hardware` and recorded in the manifest; the effective batch
+size, tile, epochs, patience, model, targets, loss and split never change.
 """
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
+import math
 import time
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 from .augmentations import AugConfig
-from .dataset import (ImageRecord, PatchDataset, TileDataset, calibration_strata,
-                      group_near_duplicates, grouped_kfold, grouped_split,
-                      load_records, merge_groups, specimen_groups,
-                      stratified_grouped_split)
+from .checkpoint import (checkpoint_digest, load_checkpoint, save_checkpoint, sync_tree)
+from .dataset import ImageRecord, TileDataset
 from .fiber_prior import PriorConfig, audit_prior
-from .losses import MultiHeadLoss, PatchLoss
-from .models.baseline_patch_model import build_baseline
-from .models.fiber_measurement_net import build_model
-from .targets import TargetConfig
-from .utils import (ensure_dir, environment_report, get_logger, pick_device,
-                    save_json, set_seed)
+from .hardware import (Hardware, autocast_dtype, choose_precision, clear_cuda,
+                       cuda_memory_stats, detect, is_oom, probe_micro_batch, profile_for,
+                       try_compile)
+from .losses import MultiHeadLoss
+from .models.fiber_net import build_model
+from .specimens import assert_no_leakage
+from .targets import TargetConfig, strata_weights_from_widths
+from .utils import (LOG, ensure_dir, environment_report, now_iso, package_version,
+                    pick_device, rng_state_restore, save_json, set_seed)
 
-LOG = get_logger(__name__)
+PROTOCOL_KEYS = ("tile", "effective_batch", "epochs", "patience", "lr", "weight_decay",
+                 "samples_per_image", "val_samples_per_image", "monitor")
 
 
-# --------------------------------------------------------------------------- #
 def load_config(path: str | Path) -> dict[str, Any]:
     import yaml
 
-    cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    validate_config(cfg)
-    return cfg
-
-
-def validate_config(cfg: dict[str, Any]) -> None:
-    """Fail loudly and early on a malformed config rather than mid-training."""
-    required = {"data": ("labels_csv", "image_dir"),
-                "train": ("epochs", "batch_size", "lr"),
-                "model": (),
-                "output": ("dir",)}
-    for section, keys in required.items():
-        if section not in cfg:
-            raise ValueError(f"config is missing the '{section}' section")
-        for k in keys:
-            if k not in cfg[section]:
-                raise ValueError(f"config['{section}'] is missing '{k}'")
-    if cfg["train"]["epochs"] <= 0:
-        raise ValueError("train.epochs must be positive")
-    if not 0 < cfg["train"]["lr"] < 1:
-        raise ValueError("train.lr looks implausible")
-
-
-def _sub(cfg: dict[str, Any], *path: str, default: Any = None) -> Any:
-    node: Any = cfg
-    for p in path:
-        if not isinstance(node, dict) or p not in node:
-            return default
-        node = node[p]
-    return node
-
-
-def build_splits(records: list[ImageRecord], cfg: dict[str, Any]
-                 ) -> dict[str, list[str]]:
-    images = {r.image_id: r.image() for r in records}
-    groups = group_near_duplicates(
-        images, hamming_max=_sub(cfg, "split", "duplicate_hamming", default=6))
-    ids = [r.image_id for r in records]
-    if _sub(cfg, "split", "group_by_specimen", default=True):
-        groups = merge_groups(groups, specimen_groups(ids))
-    if _sub(cfg, "split", "stratify", default=True):
-        return stratified_grouped_split(
-            ids, calibration_strata(records),
-            val_frac=_sub(cfg, "split", "val_frac", default=0.2),
-            test_frac=_sub(cfg, "split", "test_frac", default=0.2),
-            seed=_sub(cfg, "seed", default=1337), groups=groups)
-    return grouped_split(ids,
-                         val_frac=_sub(cfg, "split", "val_frac", default=0.2),
-                         test_frac=_sub(cfg, "split", "test_frac", default=0.2),
-                         seed=_sub(cfg, "seed", default=1337), groups=groups)
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
 def _prior_cfg(cfg: dict[str, Any]) -> PriorConfig:
-    raw = _sub(cfg, "prior", default={}) or {}
+    raw = dict(cfg.get("prior") or {})
     known = {k: v for k, v in raw.items() if k in PriorConfig.__dataclass_fields__}
-    if "sigmas" in known and isinstance(known["sigmas"], list):
+    if isinstance(known.get("sigmas"), list):
         known["sigmas"] = tuple(known["sigmas"])
     return PriorConfig(**known)
 
 
-class PriorAuditError(RuntimeError):
-    """The fiber prior failed its own audit and training would be wasted."""
+def _target_cfg(cfg: dict[str, Any], train_widths: np.ndarray | None = None) -> TargetConfig:
+    raw = dict(cfg.get("targets") or {})
+    known = {k: v for k, v in raw.items() if k in TargetConfig.__dataclass_fields__}
+    for k in ("strata_edges", "strata_weights", "ratio_clip"):
+        if isinstance(known.get(k), list):
+            known[k] = tuple(known[k])
+    t = TargetConfig(**known)
+    if train_widths is not None and len(train_widths):
+        t.strata_weights = strata_weights_from_widths(train_widths, t.strata_edges,
+                                                     t.strata_weight_cap)
+    return t
 
 
-class AngleConventionError(RuntimeError):
-    """Fields disagree on the angle convention and are about to be pooled."""
+def _aug_cfg(cfg: dict[str, Any]) -> AugConfig:
+    raw = dict(cfg.get("augment") or {})
+    return AugConfig(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in raw.items()
+                        if k in AugConfig.__dataclass_fields__})
 
 
-def check_priors(records: list[ImageRecord], out_dir: str | Path, *,
-                 cfg: PriorConfig | None = None,
-                 strict: bool = True) -> dict[str, Any]:
-    """Audit the fiber prior on every field before spending a GPU hour on it.
+def resolve_protocol(cfg: dict[str, Any], run_mode: str) -> dict[str, Any]:
+    key = "smoke_protocol" if run_mode == "FAST_SMOKE_TEST" else "protocol"
+    proto = dict(cfg.get(key) or {})
+    missing = [k for k in PROTOCOL_KEYS if k not in proto]
+    if missing:
+        raise ValueError(f"config['{key}'] is missing {missing}")
+    proto["run_mode"] = run_mode
+    proto["model"] = dict(cfg.get("model") or {})
+    proto["targets"] = dict(cfg.get("targets") or {})
+    proto["loss_weights"] = dict(cfg.get("loss_weights") or {})
+    proto["augment"] = dict(cfg.get("augment") or {})
+    proto["prior"] = dict(cfg.get("prior") or {})
+    proto["seed"] = int(cfg.get("seed", 1337))
+    if run_mode == "FAST_SMOKE_TEST":
+        proto["model"] = dict(proto["model"], **(cfg.get("smoke_model") or {}))
+    return proto
 
-    ``centre_coverage`` is the number to read: the fraction of manually measured
-    centres that land inside the derived fiber mask.  The ignore map is built
-    from that mask, so a mask that misses fibers silently reinstates the exact
-    failure it exists to prevent.
-    """
-    report: dict[str, Any] = {}
-    failed: dict[str, list[str]] = {}
+
+def protocol_digest(proto: dict[str, Any], split_digest: str = "") -> str:
+    blob = json.dumps({"protocol": proto, "split": split_digest}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+class _VirtualSampler:
+    """Yields ``epoch * n + i`` so tile randomness varies per epoch while workers
+    stay persistent; the order is a deterministic function of (seed, epoch)."""
+
+    def __init__(self, n: int, seed: int, epoch: int) -> None:
+        self.n, self.seed, self.epoch = int(n), int(seed), int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed * 100_003 + self.epoch)
+        base = self.epoch * self.n
+        return iter([int(base + i) for i in rng.permutation(self.n)])
+
+    def __len__(self) -> int:
+        return self.n
+
+
+def prior_gate(records: Sequence[ImageRecord], pcfg: PriorConfig, out_dir: Path
+               ) -> tuple[list[ImageRecord], dict[str, Any]]:
+    """Audit every training/validation prior; exclude failures with a reason."""
+    report, keep = {}, []
     for rec in records:
         try:
-            rep = audit_prior(rec.prior(), rec.annotations, rec.image(), cfg)
-            report[rec.image_id] = rep
-            if not rep.get("ok", True):
-                failed[rec.image_id] = rep.get("failures", [])
-        except Exception as exc:                          # pragma: no cover
-            LOG.error("prior audit failed for %s: %s", rec.image_id, exc)
-            failed[rec.image_id] = [f"audit raised {exc!r}"]
-    save_json(report, Path(out_dir) / "prior_audit.json")
-
-    if not failed:
-        LOG.info("fiber prior passed on all %d field(s)", len(report))
-        return report
-
-    lines = [f"  {k}: " + "; ".join(v) for k, v in sorted(failed.items())]
-    msg = ("the fiber prior failed its audit on %d of %d field(s):\n%s\n"
-           "Run fiber_prior.tune_prior_config() on a few fields and copy the "
-           "result into config['prior'], or set config['prior']['strict']=False "
-           "to train anyway and record that the run is not evidence."
-           % (len(failed), len(report), "\n".join(lines)))
-    if strict:
-        # [v3] v2 logged this and trained anyway -- twice, in the August run.
-        raise PriorAuditError(msg)
-    LOG.error("%s", msg)
-    return report
-
-
-def _check_angle_conventions(records: list[ImageRecord], out_dir: str | Path, *,
-                             strict: bool = True) -> "Any":
-    """[v3] Refuse to pool fields whose angle column means different things.
-
-    Only reached when ``targets.orientation_source`` is ``chord``.  With the
-    default (``image``) the convention is irrelevant to training, and the audit
-    stays advisory -- but it is still worth running, because a field that
-    prefers a different convention from its own specimen usually indicates a
-    mis-registered export rather than a different pen.
-    """
-    from .angle_audit import audit_records
-
-    df = audit_records(records)
-    save_json({"conventions": df.to_dict(orient="records") if len(df) else []},
-              Path(out_dir) / "angle_audit.json")
-    if len(df) and df["best"].nunique() > 1:
-        msg = ("orientation_source='chord' but the fields disagree on the "
-               "angle convention (%s). Pooling them trains the model on the "
-               "disagreement. Resolve it per source_csv, drop the odd fields, "
-               "or use orientation_source='image'."
-               % ", ".join(sorted(df["best"].unique())))
-        if strict:
-            raise AngleConventionError(msg)
-        LOG.error("%s", msg)
-    return df
+            rep = audit_prior(rec.prior(), rec.annotations, rec.image(), pcfg)
+        except Exception as exc:                          # noqa: BLE001
+            rep = {"ok": False, "failures": [f"audit raised {exc!r}"]}
+        report[rec.image_id] = rep
+        if rep.get("ok", False):
+            keep.append(rec)
+    save_json(report, out_dir / "prior_audit.json")
+    dropped = sorted(set(r.image_id for r in records) - set(r.image_id for r in keep))
+    if dropped:
+        LOG.warning("prior audit excluded %d field(s) from training/validation: %s",
+                    len(dropped), dropped)
+    return keep, {"report": report, "excluded": dropped}
 
 
 # --------------------------------------------------------------------------- #
-def train(cfg: dict[str, Any], *, model_kind: str = "full",
-          resume: str | None = None,
-          _forced_splits: dict[str, list[str]] | None = None) -> dict[str, Any]:
+def train(cfg: dict[str, Any], *, records: Sequence[ImageRecord], split: dict[str, Any],
+          run_dir: str | Path, run_mode: str = "FULL_RUN", drive_dir: str | Path | None = None,
+          resume: bool = True, hw: Hardware | None = None, user: str = "",
+          max_seconds: float | None = None) -> dict[str, Any]:
     import torch
     from torch.utils.data import DataLoader
 
-    seed = int(_sub(cfg, "seed", default=1337))
-    set_seed(seed, deterministic=bool(_sub(cfg, "deterministic", default=True)))
-    device = pick_device(_sub(cfg, "device", default="auto"))
-    out_dir = ensure_dir(_sub(cfg, "output", "dir", default="outputs"))
-    LOG.info("device=%s output=%s", device, out_dir)
-
-    pcfg = _prior_cfg(cfg)
-    records = load_records(cfg["data"]["labels_csv"], cfg["data"]["image_dir"],
-                           mask_dir=_sub(cfg, "data", "mask_dir"),
-                           prior_cfg=pcfg,
-                           prior_cache_dir=(_sub(cfg, "prior", "cache_dir")
-                                            or Path(out_dir) / "prior_cache"))
-    if not records:
-        raise RuntimeError("no usable image records; check labels_csv and image_dir")
-    splits = _forced_splits or build_splits(records, cfg)
-    save_json(splits, Path(out_dir) / "splits.json")
-
-    _spec = specimen_groups(splits["val"]) if splits["val"] else {}
-    n_val_groups = len(set(_spec.values()))
-    if 0 < n_val_groups < 2:
-        LOG.warning("validation is %d field(s) from a single specimen. Treat this "
-                    "as model selection only, not as a generalisation estimate; "
-                    "a separate outer specimen is required for a quoted result.",
-                    len(splits["val"]))
-
-    proof_of_concept = len(splits["val"]) == 0
-    if proof_of_concept:
-        LOG.warning("this training run has no validation split. That is valid for a "
-                    "fixed-schedule pretrain/refit stage only when a separate outer "
-                    "test specimen remains sealed; do not quote this run's own loss "
-                    "as a generalisation metric.")
+    if run_mode not in ("FULL_RUN", "FAST_SMOKE_TEST"):
+        raise ValueError("run_mode must be FULL_RUN or FAST_SMOKE_TEST")
+    hw = hw or detect()
+    if run_mode == "FULL_RUN" and hw.device != "cuda":
+        raise RuntimeError(
+            "FULL_RUN requires a CUDA GPU. Runtime > Change runtime type > GPU, then re-run. "
+            "The protocol is NOT reduced to fit a CPU; use RUN_MODE='FAST_SMOKE_TEST' "
+            "to exercise the code path only.")
+    device = pick_device("cuda" if hw.device == "cuda" else "cpu")
+    proto = resolve_protocol(cfg, run_mode)
+    seed = int(proto["seed"])
+    set_seed(seed, deterministic=bool(cfg.get("deterministic", True)))
+    assert_no_leakage(split)
+    run_dir = ensure_dir(run_dir)
+    pdig = protocol_digest(proto, split.get("digest", ""))
+    prof = profile_for(hw)
+    precision = choose_precision(hw, str(cfg.get("hardware", {}).get("precision", "auto")))
+    ac_dtype = autocast_dtype(precision)
 
     by_id = {r.image_id: r for r in records}
-    tr = [by_id[i] for i in splits["train"]]
-    va = [by_id[i] for i in splits["val"]] or tr
+    tr = [by_id[i] for i in split["train"] if i in by_id]
+    va = [by_id[i] for i in split["val"] if i in by_id]
+    if not tr:
+        raise RuntimeError("no training records after applying the split")
+    if not va:
+        raise RuntimeError("validation split is empty; model selection needs held-out groups")
+    pcfg = _prior_cfg(cfg)
+    tr, gate_tr = prior_gate(tr, pcfg, run_dir)
+    va, gate_va = prior_gate(va, pcfg, run_dir / "val_prior_audit_tmp")
+    if not tr or not va:
+        raise RuntimeError("prior audit left no usable training or validation field")
+    train_widths = np.concatenate([r.annotations["width_px"].to_numpy(float) for r in tr])
+    tcfg = _target_cfg({**cfg, "targets": proto["targets"]}, train_widths)
+    aug = _aug_cfg({**cfg, "augment": proto["augment"]})
 
-    if bool(_sub(cfg, "prior", "enabled", default=True)) and \
-            bool(_sub(cfg, "prior", "audit", default=True)):
-        check_priors(tr + va, out_dir, cfg=pcfg,
-                     strict=bool(_sub(cfg, "prior", "strict", default=True)))
+    tile = int(proto["tile"])
+    eff_bs = int(proto["effective_batch"])
+    epochs = int(proto["epochs"])
+    patience = int(proto["patience"])
+    model = build_model(proto["model"]).to(device)
+    criterion = MultiHeadLoss(proto["loss_weights"], mode=tcfg.mode,
+                              use_uncertainty=bool(cfg.get("loss", {}).get("uncertainty", True)))
+    monitor_criterion = MultiHeadLoss(proto["loss_weights"], mode=tcfg.mode, use_uncertainty=False)
 
-    # [v3] orientation supervised from the chord is only meaningful if every
-    # export agrees on what the chord angle means. The August audit found three
-    # different conventions across twelve fields and training pooled them.
-    if str(_sub(cfg, "targets", "orientation_source", default="image")) != "image":
-        _check_angle_conventions(tr + va, out_dir,
-                                 strict=bool(_sub(cfg, "targets",
-                                                  "strict_angles", default=True)))
+    ds_tr = TileDataset(tr, tile=tile, samples_per_image=int(proto["samples_per_image"]),
+                        aug=aug, targets=tcfg, train=True, seed=seed, prior_cfg=pcfg)
+    ds_va = TileDataset(va, tile=tile, samples_per_image=int(proto["val_samples_per_image"]),
+                        targets=tcfg, train=False, seed=seed + 1, prior_cfg=pcfg)
 
-    aug = AugConfig(**{k: tuple(v) if isinstance(v, list) else v
-                       for k, v in (_sub(cfg, "augment", default={}) or {}).items()
-                       if k in AugConfig.__dataclass_fields__})
-    tcfg = TargetConfig(**{k: v for k, v in (_sub(cfg, "targets", default={}) or {}).items()
-                           if k in TargetConfig.__dataclass_fields__})
+    # ---- hardware-only decisions -------------------------------------- #
+    def _fake_targets(mb, t, dev):
+        return {"center": torch.zeros(mb, 1, t, t, device=dev),
+                "segment": torch.zeros(mb, 1, t, t, device=dev),
+                "cos2t": torch.ones(mb, 1, t, t, device=dev),
+                "sin2t": torch.zeros(mb, 1, t, t, device=dev),
+                "width": torch.zeros(mb, 1, t, t, device=dev),
+                "validity": torch.zeros(mb, 1, t, t, device=dev),
+                "validity_mask": torch.ones(mb, 1, t, t, device=dev),
+                "reg_mask": torch.ones(mb, 1, t, t, device=dev),
+                "ignore": torch.zeros(mb, 1, t, t, device=dev),
+                "dist": torch.ones(mb, 1, t, t, device=dev),
+                "dist_weight": torch.ones(mb, 1, t, t, device=dev),
+                "strata_weight": torch.ones(mb, 1, t, t, device=dev)}
 
-    if model_kind == "baseline":
-        ds_tr = PatchDataset(tr, patch=_sub(cfg, "baseline", "patch", default=64),
-                             neg_per_pos=_sub(cfg, "baseline", "neg_per_pos", default=1.0),
-                             aug=aug, train=True, seed=seed)
-        ds_va = PatchDataset(va, patch=_sub(cfg, "baseline", "patch", default=64),
-                             neg_per_pos=1.0, train=False, seed=seed + 1)
-        model = build_baseline(_sub(cfg, "baseline", default={})).to(device)
-        criterion = PatchLoss(_sub(cfg, "loss_weights", default={}),
-                              use_uncertainty=_sub(cfg, "loss", "uncertainty",
-                                                   default=True))
+    if device.type == "cuda":
+        micro = probe_micro_batch(model, tile=tile, candidates=prof["micro_batch_candidates"],
+                                  device=device, precision=precision, effective_batch=eff_bs,
+                                  loss_fn=criterion, target_maker=_fake_targets)
     else:
-        tile = int(_sub(cfg, "train", "tile", default=384))
-        use_prior = bool(_sub(cfg, "prior", "enabled", default=True))
-        ds_tr = TileDataset(tr, tile=tile, aug=aug, targets=tcfg, train=True,
-                            samples_per_image=_sub(cfg, "train", "samples_per_image",
-                                                   default=40), seed=seed,
-                            prior_cfg=pcfg, use_prior=use_prior)
-        ds_va = TileDataset(va, tile=tile, targets=tcfg, train=False,
-                            samples_per_image=max(4, _sub(cfg, "train",
-                                                          "samples_per_image",
-                                                          default=40) // 4),
-                            seed=seed + 1, prior_cfg=pcfg, use_prior=use_prior)
-        model = build_model(_sub(cfg, "model", default={})).to(device)
-        criterion = MultiHeadLoss(_sub(cfg, "loss_weights", default={}),
-                                  use_uncertainty=_sub(cfg, "loss", "uncertainty",
-                                                       default=True))
+        micro = min(eff_bs, int(prof["micro_batch_candidates"][0]))
+        while eff_bs % micro:
+            micro -= 1
+    accum = eff_bs // micro
+    workers = int(prof["num_workers"])
+    compile_note = "not requested"
+    if bool(cfg.get("hardware", {}).get("compile", False)) and device.type == "cuda":
+        model, compile_note = try_compile(model, example=torch.randn(1, 1, tile, tile, device=device))
 
-    bs = int(cfg["train"]["batch_size"])
-    workers = int(_sub(cfg, "train", "num_workers", default=2))
-    # [v3] persistent workers. Without them the loader tears its workers down
-    # after every epoch, and each new worker re-reads (or recomputes) the fiber
-    # prior for every image it touches -- the in-memory cache on ImageRecord
-    # only lives as long as the worker does. That is a large part of why stage 1
-    # ran at 2248 s/epoch, which is 15.6 h over 25 epochs: longer than a Colab
-    # session, so the run could never finish.
-    loader_kw: dict[str, Any] = {}
-    if workers > 0:
-        loader_kw = {"persistent_workers": True, "prefetch_factor": 4}
-    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, num_workers=workers,
-                       drop_last=len(ds_tr) > bs,
-                       pin_memory=(device.type == "cuda"), **loader_kw)
-    dl_va = DataLoader(ds_va, batch_size=bs, shuffle=False, num_workers=workers,
-                       **loader_kw)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]),
-                            weight_decay=float(_sub(cfg, "train", "weight_decay",
-                                                    default=1e-4)))
-    epochs = int(cfg["train"]["epochs"])
+    opt = torch.optim.AdamW(model.parameters(), lr=float(proto["lr"]),
+                            weight_decay=float(proto["weight_decay"]))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    use_amp = bool(_sub(cfg, "train", "amp", default=True)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
-
-    init_from = _sub(cfg, "train", "init_from", default=None)
-    if init_from and Path(init_from).exists():
-        ck0 = torch.load(init_from, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(ck0["model"], strict=False)
-        LOG.info("initialised from %s (%d missing, %d unexpected tensors)",
-                 init_from, len(missing), len(unexpected))
+    scaler = torch.amp.GradScaler("cuda", enabled=(precision == "fp16" and device.type == "cuda"))
 
     start_epoch, best, best_epoch = 0, float("inf"), -1
-    patience = int(_sub(cfg, "train", "early_stop_patience", default=15))
-    monitor_loss = str(_sub(cfg, "train", "monitor", default="val_monitor"))
-    history: dict[str, list[float]] = {"train_loss": [], "val_loss": [],
-                                       "val_monitor": []}
-    if resume and Path(resume).exists():
-        ck = torch.load(resume, map_location=device)
+    history: dict[str, list[float]] = {"train_loss": [], "val_loss": [], "val_monitor": [],
+                                       "epoch_seconds": [], "lr": []}
+    last_path, best_path = run_dir / "last.pt", run_dir / "best.pt"
+    resumed_from = None
+    if resume and last_path.exists():
+        ck = load_checkpoint(last_path, map_location=device)
+        if ck.get("protocol_digest") != pdig:
+            raise RuntimeError(f"last.pt was trained under protocol {ck.get('protocol_digest')} "
+                               f"but this run is {pdig}; refusing to resume across protocols. "
+                               "Use a new RUN_TAG.")
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         sched.load_state_dict(ck["scheduler"])
-        start_epoch = int(ck.get("epoch", 0)) + 1
-        best = float(ck.get("best", best))
-        history = ck.get("history", history)
-        LOG.info("resumed from %s at epoch %d", resume, start_epoch)
+        if ck.get("scaler") is not None and scaler.is_enabled():
+            scaler.load_state_dict(ck["scaler"])
+        start_epoch = int(ck["epoch"]) + 1
+        best, best_epoch = float(ck["best"]), int(ck["best_epoch"])
+        history = ck["history"]
+        rng_state_restore(ck.get("rng"))
+        resumed_from = {"path": str(last_path), "epoch": int(ck["epoch"]),
+                        "digest": checkpoint_digest(last_path)}
+        LOG.info("resumed from %s at epoch %d (best %.4f @ %d)", last_path, start_epoch,
+                 best, best_epoch + 1)
 
-    # [v4] A second criterion with the uncertainty term swapped for a plain
-    # Huber.  logvar is clamped to [-6, 6], so exp(-logvar) reaches ~403 and the
-    # training objective's val number moves mostly with the width head's
-    # CONFIDENCE.  Selecting on that picks the least confident epoch, not the
-    # most accurate one.  This monitor can only move when the predictions move.
-    monitor_criterion = type(criterion)(_sub(cfg, "loss_weights", default={}),
-                                        use_uncertainty=False)
+    loader_kw: dict[str, Any] = {"num_workers": workers, "pin_memory": device.type == "cuda"}
+    if workers > 0:
+        loader_kw.update(persistent_workers=True, prefetch_factor=4)
 
-    def run_epoch(loader, training: bool):
+    manifest: dict[str, Any] = {
+        "package_version": package_version(), "run_mode": run_mode, "user": user,
+        "protocol": proto, "protocol_digest": pdig, "split_digest": split.get("digest"),
+        "split": {k: split.get(k) for k in ("train", "val", "test", "test_groups", "val_groups")},
+        "prior_gate": {"train_excluded": gate_tr["excluded"], "val_excluded": gate_va["excluded"]},
+        "strata_weights": list(tcfg.strata_weights), "strata_edges": list(tcfg.strata_edges),
+        "hardware": hw.to_dict(), "precision": precision, "micro_batch": micro,
+        "grad_accumulation": accum, "effective_batch": eff_bs, "num_workers": workers,
+        "compile": compile_note, "environment": environment_report(),
+        "started_at": now_iso(), "resumed_from": resumed_from,
+        "n_train_images": len(tr), "n_val_images": len(va),
+        "n_parameters": int(model.n_parameters() if hasattr(model, "n_parameters")
+                            else sum(p.numel() for p in model.parameters())),
+    }
+    save_json(manifest, run_dir / "run_manifest.json")
+
+    def _to_dev(batch):
+        return {k: (v.to(device, non_blocking=True) if hasattr(v, "to") else v)
+                for k, v in batch.items()}
+
+    def run_epoch(epoch: int, training: bool, micro_bs: int, accum_steps: int):
         model.train(training)
-        total, mon_total, n = 0.0, 0.0, 0
+        ds = ds_tr if training else ds_va
+        if training:
+            loader = DataLoader(ds, batch_size=micro_bs, sampler=_VirtualSampler(len(ds), seed, epoch),
+                                drop_last=len(ds) >= micro_bs, **loader_kw)
+        else:
+            loader = DataLoader(ds, batch_size=micro_bs, shuffle=False, **loader_kw)
+        total, mon_total, n, n_tiles = 0.0, 0.0, 0, 0
+        opt.zero_grad(set_to_none=True)
+        step_in_accum = 0
         for batch in loader:
-            batch = {k: (v.to(device, non_blocking=True)
-                         if hasattr(v, "to") else v) for k, v in batch.items()}
+            batch = _to_dev(batch)
+            bs = batch["image"].shape[0]
             with torch.set_grad_enabled(training):
-                with torch.autocast(device_type=device.type, enabled=use_amp):
+                with torch.autocast(device_type=device.type, dtype=ac_dtype,
+                                    enabled=ac_dtype is not None and device.type == "cuda"):
                     out = model(batch["image"])
-                    loss, parts = criterion(out, batch)
-                    if not training:
-                        with torch.no_grad():
-                            mon, _ = monitor_criterion(out, batch)
-                        mon_total += float(mon.detach()) * batch["image"].shape[0]
+                loss, _parts = criterion({k: v.float() for k, v in out.items()}, batch)
+                if not training:
+                    with torch.no_grad():
+                        mon, _ = monitor_criterion({k: v.float() for k, v in out.items()}, batch)
+                    mon_total += float(mon.detach()) * bs
             if training:
-                opt.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                scaler.step(opt)
-                scaler.update()
-            total += float(loss.detach()) * batch["image"].shape[0]
-            n += batch["image"].shape[0]
-        return total / max(1, n), mon_total / max(1, n)
+                scaler.scale(loss / accum_steps).backward()
+                step_in_accum += 1
+                if step_in_accum == accum_steps:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad(set_to_none=True)
+                    step_in_accum = 0
+            total += float(loss.detach()) * bs
+            n += bs
+            n_tiles += bs
+        if training and step_in_accum:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+        return total / max(1, n), mon_total / max(1, n), n_tiles
 
-    manifest = {"config": cfg, "seed": seed, "environment": environment_report(),
-                "splits": splits, "model_kind": model_kind,
-                "proof_of_concept": proof_of_concept,
-                "n_train_images": len(tr), "n_val_images": len(splits["val"])}
-    save_json(manifest, Path(out_dir) / "run_manifest.json")
-
-    # [v3] wall-clock budget. A hosted runtime is reclaimed on a timer, and a
-    # run that is killed mid-epoch leaves a checkpoint nobody can interpret.
-    # Stop cleanly instead, with the reason recorded in the manifest.
-    budget_s = float(_sub(cfg, "train", "max_seconds", default=0.0) or 0.0)
     t_start = time.time()
     stop_reason = "completed"
-
+    tiles_seen = 0
+    oom_events = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
-        tr_loss, _ = run_epoch(dl_tr, True)
-        va_loss, va_monitor = run_epoch(dl_va, False)
+        while True:
+            try:
+                tr_loss, _, n_t = run_epoch(epoch, True, micro, accum)
+                break
+            except Exception as exc:                        # noqa: BLE001
+                if is_oom(exc) and micro > 1:
+                    opt.zero_grad(set_to_none=True)
+                    clear_cuda()
+                    oom_events.append({"epoch": epoch, "micro_batch": micro})
+                    micro = max(1, micro // 2)
+                    accum = eff_bs // micro
+                    LOG.warning("CUDA OOM at epoch %d: micro-batch -> %d, accumulation -> %d "
+                                "(tile, model and effective batch unchanged)", epoch + 1, micro, accum)
+                    continue
+                raise
+        va_loss, va_mon, _ = run_epoch(epoch, False, micro, accum)
         sched.step()
+        dt = time.time() - t0
+        tiles_seen += n_t
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(va_loss)
-        history.setdefault("val_monitor", []).append(va_monitor)
-        dt = time.time() - t0
-        LOG.info("epoch %3d/%d  train=%.4f  val=%.4f  monitor=%.4f  (%.1fs)",
-                 epoch + 1, epochs, tr_loss, va_loss, va_monitor, dt)
-        if epoch == start_epoch:
-            projected = dt * (epochs - start_epoch)
-            LOG.info("projected total: %.1f h at this rate", projected / 3600.0)
-            if budget_s and projected > budget_s:
-                LOG.warning("that exceeds the %.1f h budget -- this run will "
-                            "stop early rather than be killed mid-epoch. Lower "
-                            "train.samples_per_image or train.epochs to finish "
-                            "the schedule instead.", budget_s / 3600.0)
-
-        ck = {"model": model.state_dict(), "optimizer": opt.state_dict(),
-              "scheduler": sched.state_dict(), "epoch": epoch, "best": best,
-              "history": history, "config": cfg, "model_kind": model_kind}
-        torch.save(ck, Path(out_dir) / f"last_{model_kind}.pt")
-        score = va_monitor if monitor_loss == "val_monitor" else va_loss
-        if score < best:
+        history["val_monitor"].append(va_mon)
+        history["epoch_seconds"].append(dt)
+        history["lr"].append(float(opt.param_groups[0]["lr"]))
+        score = va_mon if proto["monitor"] == "val_monitor" else va_loss
+        improved = score < best
+        if improved:
             best, best_epoch = score, epoch
-            ck["best"] = best
-            torch.save(ck, Path(out_dir) / f"best_{model_kind}.pt")
-        if budget_s and (time.time() - t_start) > budget_s:
-            stop_reason = f"time budget of {budget_s / 3600.0:.1f} h reached"
-            LOG.warning("stopping after epoch %d: %s", epoch + 1, stop_reason)
+        LOG.info("epoch %3d/%d  train=%.4f  val=%.4f  monitor=%.4f  %s (%.1fs, %.1f tiles/s)",
+                 epoch + 1, epochs, tr_loss, va_loss, va_mon, "*" if improved else " ",
+                 dt, n_t / max(dt, 1e-6))
+        ck_kw = dict(model=model, optimizer=opt, scheduler=sched, scaler=scaler, epoch=epoch,
+                     best=best, best_epoch=best_epoch, history=history, config=cfg,
+                     split_manifest=split, protocol_digest=pdig,
+                     extra={"run_mode": run_mode, "micro_batch": micro, "precision": precision})
+        save_checkpoint(last_path, **ck_kw)
+        if improved:
+            save_checkpoint(best_path, **ck_kw)
+        if drive_dir is not None:
+            try:
+                sync_tree(run_dir, drive_dir)
+            except Exception as exc:                        # noqa: BLE001
+                LOG.warning("Drive sync failed (%s); continuing locally", exc)
+        if max_seconds and (time.time() - t_start) > max_seconds:
+            stop_reason = f"wall-clock limit {max_seconds/3600:.1f} h reached at epoch {epoch + 1}"
+            LOG.warning("%s -- resume this run to finish the protocol", stop_reason)
             break
-        if best_epoch == epoch:
-            pass                     # improved this epoch; patience clock reset
-        elif patience > 0 and (epoch - best_epoch) >= patience:
-            # The first run of this project trained for 10 epochs against a
-            # config default of 60 and stopped while validation was still
-            # falling.  Stopping is now decided by the curve, not by whoever
-            # edited the cell.
-            LOG.info("early stop: no val improvement for %d epochs "
-                     "(best %.4f at epoch %d)", patience, best, best_epoch + 1)
+        if patience > 0 and (epoch - best_epoch) >= patience:
+            stop_reason = f"early stop: no improvement for {patience} epochs"
+            LOG.info("%s (best %.4f at epoch %d)", stop_reason, best, best_epoch + 1)
             break
 
-    from .visualization import training_curves
-    training_curves(history, Path(out_dir) / f"training_curves_{model_kind}.png")
-    save_json({"history": history, "best_val_loss": best,
-               "best_epoch": best_epoch + 1},
-              Path(out_dir) / f"history_{model_kind}.json")
-    LOG.info("done. best val loss = %.4f at epoch %d", best, best_epoch + 1)
-    if best_epoch + 1 >= epochs and epochs > 1:
-        LOG.warning("the best epoch was the last one: validation was still "
-                    "improving when the budget ran out. Raise train.epochs.")
-    return {"best_val_loss": best, "history": history, "splits": splits,
-            "best_epoch": best_epoch + 1, "stop_reason": stop_reason,
-            "n_val_specimens": n_val_groups,
-            "generalisation_evidence": bool(n_val_groups >= 2)}
-
-
-def cross_validate(cfg: dict[str, Any], *, n_splits: int = 5,
-                   model_kind: str = "full") -> dict[str, Any]:
-    """Grouped K-fold over the labelled fields.
-
-    With eleven fields a single held-out pair is not an evaluation, it is an
-    anecdote: swap which two images are held out and the numbers move more than
-    any change to the model does.  K-fold spends the same images k times and
-    reports the spread, which is the only defensible way to quote a result at
-    this sample size.  The cost is k training runs, which at a few minutes each
-    is nothing.
-    """
-    out_root = ensure_dir(_sub(cfg, "output", "dir", default="outputs"))
-    pcfg = _prior_cfg(cfg)
-    records = load_records(cfg["data"]["labels_csv"], cfg["data"]["image_dir"],
-                           mask_dir=_sub(cfg, "data", "mask_dir"),
-                           prior_cfg=pcfg,
-                           prior_cache_dir=Path(out_root) / "prior_cache")
-    images = {r.image_id: r.image() for r in records}
-    groups = group_near_duplicates(
-        images, hamming_max=_sub(cfg, "split", "duplicate_hamming", default=6))
-    if _sub(cfg, "split", "group_by_specimen", default=True):
-        groups = merge_groups(groups, specimen_groups([r.image_id for r in records]))
-    n_groups = len({groups.get(r.image_id, r.image_id) for r in records})
-    if n_splits > n_groups:
-        LOG.warning("asked for %d folds but there are only %d independent "
-                    "group(s); using %d (leave-one-out). More folds than groups "
-                    "would put the same specimen in train and validation.",
-                    n_splits, n_groups, n_groups)
-        n_splits = n_groups
-    if n_groups < 4:
-        LOG.error("only %d independent group(s): cross-validation here reports "
-                  "the variance between %d samples, which is not a confidence "
-                  "interval. Report the fold values individually.",
-                  n_groups, n_groups)
-    folds = grouped_kfold([r.image_id for r in records], n_splits,
-                          seed=_sub(cfg, "seed", default=1337), groups=groups)
-
-    results = []
-    for k, fold in enumerate(folds):
-        LOG.info("=== fold %d/%d: %d train, %d val ===", k + 1, len(folds),
-                 len(fold["train"]), len(fold["val"]))
-        sub = json.loads(json.dumps(cfg))          # deep copy, config is plain
-        sub["output"]["dir"] = str(Path(out_root) / f"fold{k + 1}")
-        sub["split"] = dict(sub.get("split", {}), preset=fold)
-        res = train(sub, model_kind=model_kind, _forced_splits=fold)
-        results.append({"fold": k + 1, "val_images": fold["val"],
-                        "best_val_loss": res["best_val_loss"],
-                        "best_epoch": res.get("best_epoch")})
-
-    losses = [r["best_val_loss"] for r in results]
-    summary = {"n_folds": len(results), "folds": results,
-               "val_loss_mean": float(np.mean(losses)),
-               "val_loss_sd": float(np.std(losses, ddof=1)) if len(losses) > 1 else 0.0}
-    save_json(summary, Path(out_root) / "cross_validation.json")
-    LOG.info("cross-validation: val loss %.4f +/- %.4f over %d folds",
-             summary["val_loss_mean"], summary["val_loss_sd"], len(results))
-    return summary
-
-
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Train the SEM fiber measurement model")
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--model", choices=("full", "baseline"), default="full")
-    ap.add_argument("--resume", default=None)
-    ap.add_argument("--kfold", type=int, default=0,
-                    help="run grouped K-fold cross-validation instead")
-    args = ap.parse_args(argv)
-    cfg = load_config(args.config)
-    if args.kfold:
-        cross_validate(cfg, n_splits=args.kfold, model_kind=args.model)
-    else:
-        train(cfg, model_kind=args.model, resume=args.resume)
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    elapsed = time.time() - t_start
+    manifest.update({
+        "finished_at": now_iso(), "stop_reason": stop_reason, "best_epoch": best_epoch + 1,
+        "best_monitor": best, "epochs_run": len(history["train_loss"]),
+        "training_seconds": elapsed, "tiles_per_second": tiles_seen / max(elapsed, 1e-6),
+        "micro_batch_final": micro, "grad_accumulation_final": accum,
+        "oom_events": oom_events, "cuda_memory": cuda_memory_stats(),
+        "best_checkpoint": str(best_path), "best_checkpoint_sha256":
+            checkpoint_digest(best_path) if best_path.exists() else None,
+        "last_checkpoint_sha256": checkpoint_digest(last_path) if last_path.exists() else None,
+        "history": history,
+        "protocol_complete": stop_reason in ("completed",) or stop_reason.startswith("early stop"),
+    })
+    save_json(manifest, run_dir / "run_manifest.json")
+    if drive_dir is not None:
+        try:
+            sync_tree(run_dir, drive_dir)
+        except Exception as exc:                            # noqa: BLE001
+            LOG.warning("final Drive sync failed (%s)", exc)
+    return {"best_monitor": best, "best_epoch": best_epoch + 1, "history": history,
+            "stop_reason": stop_reason, "manifest": manifest, "best_path": str(best_path),
+            "last_path": str(last_path), "target_cfg": tcfg}

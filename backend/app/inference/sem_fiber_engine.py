@@ -19,33 +19,46 @@ def _finite_or_none(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _accepted_sites(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame() if frame is None else frame.copy()
+    if "rejected_reason" not in frame.columns:
+        return frame.copy()
+    reasons = frame["rejected_reason"].fillna("").astype(str).str.strip()
+    return frame.loc[reasons.eq("")].copy()
+
+
 def map_predictions(frame: pd.DataFrame) -> list[MeasurementPrediction]:
+    """Map accepted sem_fiber_ai v7 measurement sites to FiberVision rows."""
     mapped: list[MeasurementPrediction] = []
-    for row in frame.to_dict(orient="records"):
+    for row in _accepted_sites(frame).to_dict(orient="records"):
         width_nm = _finite_or_none(row.get("width_nm"))
         metadata = {
             key: value
             for key, value in {
                 "validity": _finite_or_none(row.get("validity")),
                 "uncertainty_px": _finite_or_none(row.get("width_sigma_px")),
-                "measurement_method": row.get("measurement_method"),
-                "local_fiber_angle_deg": _finite_or_none(row.get("local_fiber_angle_deg")),
-                "recovered_thick": bool(row.get("recovered_thick", False)),
+                "fiber_angle_deg": (-_finite_or_none(row.get("fiber_angle_raster_deg")) if _finite_or_none(row.get("fiber_angle_raster_deg")) is not None else None),
+                "boundary_disagreement": _finite_or_none(row.get("boundary_disagreement")),
+                "junction_distance_px": _finite_or_none(row.get("junction_distance_px")),
+                "coherence": _finite_or_none(row.get("coherence")),
+                "branch_id": int(row["branch_id"]) if _finite_or_none(row.get("branch_id")) is not None else None,
             }.items()
             if value is not None
         }
+        external = row.get("site_id")
         mapped.append(
             MeasurementPrediction(
-                external_id=(str(row["prediction_id"]) if row.get("prediction_id") is not None else None),
+                external_id=str(external) if external is not None else None,
                 x1=float(row["x1_px"]),
                 y1=float(row["y1_px"]),
                 x2=float(row["x2_px"]),
                 y2=float(row["y2_px"]),
                 width_px=float(row["width_px"]),
                 width_nm=width_nm,
-                angle_deg=float(row.get("measurement_angle_deg", 0.0)),
+                angle_deg=-float(row.get("measurement_angle_raster_deg", 0.0)),
                 confidence=float(row.get("confidence", 0.0)),
-                source=str(row.get("measurement_source", "ai")),
+                source=str(row.get("measurement_source", "model_geometry")),
                 metadata=metadata,
             )
         )
@@ -53,29 +66,18 @@ def map_predictions(frame: pd.DataFrame) -> list[MeasurementPrediction]:
 
 
 class SemFiberEngine:
-    """Lazy wrapper around the v6.11 notebook's vendored sem_fiber_ai package."""
+    """FiberVision adapter for the embedded sem_fiber_ai v7.0.0 inference package."""
 
     def __init__(
         self,
         checkpoint_path: str | Path,
         *,
         device: str = "auto",
-        peak_threshold: float = 0.30,
-        min_validity: float = 0.30,
-        width_calibration_path: str | Path | None = None,
-        calibration_table_path: str | Path | None = None,
-        thick_recovery: bool = True,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
+        self.run_dir = self.checkpoint_path.parent
         self.device_name = device
-        self.peak_threshold = float(peak_threshold)
-        self.min_validity = float(min_validity)
-        self.width_calibration_path = Path(width_calibration_path) if width_calibration_path else None
-        self.calibration_table_path = Path(calibration_table_path) if calibration_table_path else None
-        self.thick_recovery = thick_recovery
-        self._model = None
-        self._device = None
-        self._checkpoint_meta: dict[str, Any] | None = None
+        self._run: dict[str, Any] | None = None
 
     @staticmethod
     def _ensure_vendor_path() -> None:
@@ -84,20 +86,24 @@ class SemFiberEngine:
         if str(vendor) not in sys.path:
             sys.path.insert(0, str(vendor))
 
-    def _load(self) -> None:
-        if self._model is not None:
-            return
+    def _load(self) -> dict[str, Any]:
+        if self._run is not None:
+            return self._run
         if not self.checkpoint_path.is_file():
             raise FileNotFoundError(
-                f"SEM model checkpoint not found: {self.checkpoint_path}. "
-                "Mount the trained v6.11 checkpoint and set MODEL_CHECKPOINT."
+                f"SEM v7 checkpoint not found: {self.checkpoint_path}. "
+                "Place best.pt in the configured v7 run directory."
             )
         self._ensure_vendor_path()
-        from sem_fiber_ai.src.infer import load_checkpoint
+        from sem_fiber_ai.src.infer import load_run
         from sem_fiber_ai.src.utils import pick_device
 
-        self._device = pick_device(self.device_name)
-        self._model, self._checkpoint_meta = load_checkpoint(self.checkpoint_path, self._device)
+        device = pick_device(self.device_name)
+        self._run = load_run(self.run_dir, device=device)
+        package_version = str(self._run.get("checkpoint", {}).get("package_version") or "")
+        if package_version and package_version != "7.0.0":
+            raise ValueError(f"expected sem_fiber_ai 7.0.0 checkpoint, got {package_version}")
+        return self._run
 
     def analyze(
         self,
@@ -105,55 +111,32 @@ class SemFiberEngine:
         output_dir: Path,
         nm_per_pixel: float | None = None,
     ) -> AnalysisResult:
-        self._load()
+        run = self._load()
         self._ensure_vendor_path()
-        from sem_fiber_ai.src.calibration import load_calibration_table
-        from sem_fiber_ai.src.infer import run_one
-        from sem_fiber_ai.src.postprocess import PostConfig
-
-        width_calib = None
-        if self.width_calibration_path and self.width_calibration_path.is_file():
-            from sem_fiber_ai.src.width_calibration import load_width_calibration
-            width_calib = load_width_calibration(self.width_calibration_path)
-
-        table = {}
-        if self.calibration_table_path and self.calibration_table_path.is_file():
-            table = load_calibration_table(self.calibration_table_path)
-        thick_cfg = None
-        if self.thick_recovery:
-            from sem_fiber_ai.src.thick_fiber import ThickRecoveryConfig
-            thick_cfg = ThickRecoveryConfig(enabled=True)
+        from sem_fiber_ai.src.infer import measure_image
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        frame = run_one(
-            self._model,
+        summary = measure_image(
+            run,
             image_path,
             output_dir,
-            self._device,
-            nm_per_pixel=nm_per_pixel,
-            calib_table=table,
-            post=PostConfig(
-                peak_threshold=self.peak_threshold,
-                min_validity=self.min_validity,
-            ),
-            tile=512,
-            overlap=64,
+            manual_nm_per_px=nm_per_pixel,
+            include_split_members=True,
             tta=False,
-            mc_samples=0,
             save_maps=False,
-            width_calib=width_calib,
-            zoom_panels=0,
-            thick_cfg=thick_cfg,
+            thick=False,
         )
-
-        summary_path = output_dir / f"{image_path.stem}_summary.json"
-        summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+        image_id = str(summary["image_id"])
+        sites_path = output_dir / f"{image_id}_sites.csv"
+        frame = pd.read_csv(sites_path) if sites_path.is_file() else pd.DataFrame()
         artifacts = {
             name: path
             for name, path in {
-                "predictions_csv": output_dir / f"{image_path.stem}_predictions.csv",
-                "annotated_png": output_dir / f"{image_path.stem}_annotated.png",
-                "summary_json": summary_path,
+                "sites_csv": sites_path,
+                "fibres_csv": output_dir / f"{image_id}_fibres.csv",
+                "overlay_png": output_dir / f"{image_id}_overlay.png",
+                "width_distribution_png": output_dir / f"{image_id}_width_distribution.png",
+                "summary_json": output_dir / f"{image_id}_summary.json",
             }.items()
             if path.is_file()
         }

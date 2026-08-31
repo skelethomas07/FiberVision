@@ -7,7 +7,7 @@ GitHub-ready MVP for automatic SEM fiber thickness analysis with human review an
 1. Upload an SEM image in the Next.js UI.
 2. FastAPI creates an asynchronous analysis job.
 3. An RQ worker loads the trained SEM model and runs inference outside the web process.
-4. The v6.11 notebook model is the primary detector; its wide-fiber recovery branch is enabled for new-image analysis and keeps its provenance (`ai` vs `thick_recovery`).
+4. The embedded `sem_fiber_ai` v7.0.0 package loads the deployed `best.pt` checkpoint and produces geometry-based thickness measurements with per-site confidence.
 5. The browser displays editable measurement lines with wheel zoom and drag pan.
 6. A reviewer can keep, remove, add, or correct lines.
 7. `검수 완료` freezes the review into training supervision.
@@ -17,17 +17,18 @@ Colab is not used as a production backend.
 
 ## Important model provenance
 
-The supplied final notebook `sem_fiber_ai_colab_v6_11` embeds a complete Python package. That package was extracted into `backend/vendor/sem_fiber_ai`. Its internal `__version__` is `6.6.0`; this repository calls the deployed experiment/model line `v6.11` because that is the supplied notebook revision. No trained checkpoint is committed.
+Production inference uses the `sem_fiber_ai 7.0.0` package embedded in the supplied v7 notebook. The package is vendored under `backend/vendor/sem_fiber_ai`; the trained checkpoint stays outside Git and is mounted into the worker.
 
-Place your trained checkpoint at:
+Place the v7 run files at:
 
 ```text
-models/model.pt
+models/v7/best.pt
+models/v7/physical_reference.json
 ```
 
-or change `MODEL_CHECKPOINT`.
+`selection.json` and `training_stats.json` are optional. When `selection.json` is absent, v7 uses the post-processing defaults stored in the checkpoint config.
 
-The older VisionFlux/Streamlit and `chem_frontier_learning.py` files are retained under `legacy/` for reference. The production stack does not import them.
+The older VisionFlux/Streamlit and historical learning files remain under `legacy/` for reference only. The production stack does not import them.
 
 ## Architecture
 
@@ -44,8 +45,7 @@ Browser / Next.js
        v
  Python inference worker
        |
-       +-- sem_fiber_ai learned detector
-       +-- wide-fiber recovery
+       +-- sem_fiber_ai v7 geometry detector
 ```
 
 The API process does not load PyTorch. The RQ worker imports the model lazily and keeps one engine instance in the worker process.
@@ -69,8 +69,9 @@ Prerequisites: Docker + Docker Compose and the trained checkpoint.
 
 ```bash
 cp .env.example .env
-mkdir -p models
-cp /path/to/your/checkpoint.pt models/model.pt
+mkdir -p models/v7
+cp /path/to/your/best.pt models/v7/best.pt
+cp /path/to/your/physical_reference.json models/v7/physical_reference.json
 docker compose up --build
 ```
 
@@ -158,7 +159,7 @@ Analysis results expose three work areas: `검수`, `결과`, and `내보내기`
 
 ## Add reviewed images to the next training dataset
 
-Approving a review immediately creates immutable `training_examples` rows in PostgreSQL. It does **not** automatically retrain or replace the deployed model.
+Approving a review immediately creates immutable `training_examples` rows in PostgreSQL. It does **not** automatically retrain or replace the deployed v7 model.
 
 Export audit-friendly JSONL:
 
@@ -168,37 +169,14 @@ PYTHONPATH=. python -m app.training.cli export \
   --output training_exports/approved.jsonl
 ```
 
-Materialize data in the format consumed by the vendored v6.11 training package:
+Or materialize the approved review measurements and source images for a future v7 training-data integration:
 
 ```bash
 PYTHONPATH=. python -m app.training.cli prepare \
   --output-dir training_exports/reviewed_bundle
 ```
 
-This creates:
-
-```text
-reviewed_bundle/
-├── labels.csv
-└── images/
-```
-
-`AUTO_REMOVE` rows become `is_negative=True` reviewer-rejected sites. Positive rows contain `center_x_px`, endpoints, width, measurement angle, derived local fiber angle, nm/px, and the original supervision label.
-
-To merge the reviewed examples with the original answer-sheet training data and launch a candidate retrain:
-
-```bash
-PYTHONPATH=. python -m app.training.cli retrain \
-  --base-labels-csv /data/original_processed/labels.csv \
-  --base-image-dir /data/original_images \
-  --dataset-dir training_exports/retrain_dataset \
-  --output-dir training_runs/candidate_v2 \
-  --init-from /models/model.pt
-```
-
-The command writes the exact generated training YAML into the candidate run directory and then calls `sem_fiber_ai.src.train.train()`.
-
-**Deployment is intentionally manual.** A new candidate should first be compared on a fixed image-level holdout (width distribution, sampling density, fiber-level recall, and any precision floor you decide to enforce) before changing `MODEL_CHECKPOINT`.
+The old v6 retrain command has been removed. The current v7 checkpoint was trained with the supplied v7 notebook protocol; a future retraining workflow should explicitly adapt approved FiberVision supervision to that protocol before replacing `best.pt`.
 
 ## Repository layout
 

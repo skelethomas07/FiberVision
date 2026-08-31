@@ -17,9 +17,6 @@ def _get_engine():
         _engine = SemFiberEngine(
             settings.model_checkpoint,
             device=settings.model_device,
-            width_calibration_path=settings.width_calibration_path,
-            calibration_table_path=settings.calibration_table_path,
-            thick_recovery=True,
         )
     return _engine
 

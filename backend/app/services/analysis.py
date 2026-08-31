@@ -9,7 +9,7 @@ from ..models import AnalysisJob, AnalysisStatus, ImageAsset, ModelMeasurement
 from ..queue import AnalysisQueue
 
 
-def create_analysis(session: Session, image_id: str, queue: AnalysisQueue, model_version: str = "v6.11") -> AnalysisJob:
+def create_analysis(session: Session, image_id: str, queue: AnalysisQueue, model_version: str = "v7.0.0") -> AnalysisJob:
     image = session.get(ImageAsset, image_id)
     if image is None:
         raise LookupError(f"image not found: {image_id}")
@@ -31,7 +31,7 @@ def create_imported_analysis(
     session: Session,
     image_id: str,
     measurements: list[dict],
-    model_version: str = "v6.11",
+    model_version: str = "v7.0.0",
 ) -> AnalysisJob:
     image = session.get(ImageAsset, image_id)
     if image is None:
