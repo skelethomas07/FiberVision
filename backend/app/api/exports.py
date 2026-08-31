@@ -7,8 +7,14 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request, Response
 from sqlalchemy import select
 
-from ..models import AnalysisJob, AnalysisStatus, ReviewMeasurement, ReviewSession
-from ..services.exports import build_csv, build_export_zip, render_overlay
+from ..models import AnalysisJob, AnalysisStatus, ReviewMeasurement
+from ..services.exports import (
+    build_csv,
+    build_export_zip,
+    build_orientation_distribution_csv,
+    build_thickness_range_csv,
+    render_overlay,
+)
 from ..services.review import get_or_create_review
 from ..services.visionflux_import import preview_storage_key
 
@@ -62,6 +68,26 @@ def _attachment(content: bytes, media_type: str, filename: str) -> Response:
 def export_csv(analysis_id: str, request: Request):
     rows, _, base_name = _context(analysis_id, request)
     return _attachment(build_csv(rows), "text/csv; charset=utf-8", f"{base_name}_measurements.csv")
+
+
+@router.get("/{analysis_id}/exports/orientation")
+def export_orientation(analysis_id: str, request: Request):
+    rows, _, base_name = _context(analysis_id, request)
+    return _attachment(
+        build_orientation_distribution_csv(rows),
+        "text/csv; charset=utf-8",
+        f"{base_name}_orientation_0-180deg.csv",
+    )
+
+
+@router.get("/{analysis_id}/exports/thickness-range")
+def export_thickness_range(analysis_id: str, request: Request, min_nm: float, max_nm: float):
+    rows, _, base_name = _context(analysis_id, request)
+    try:
+        content = build_thickness_range_csv(rows, min_nm, max_nm)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _attachment(content, "text/csv; charset=utf-8", f"{base_name}_thickness_normal_range.csv")
 
 
 @router.get("/{analysis_id}/exports/overlay")

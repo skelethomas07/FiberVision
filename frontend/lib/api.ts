@@ -46,123 +46,54 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export type AuthUser = {
-  id: string;
-  email: string;
-  must_change_password: boolean;
-};
-
+export type AuthUser = { id: string; email: string; must_change_password: boolean; };
 export type ImageAsset = {
-  id: string;
-  filename: string;
-  nm_per_pixel: number | null;
+  id: string; filename: string; nm_per_pixel: number | null;
   calibration_source: "manual" | "scale_bar" | "none";
-  scale_label: string | null;
-  scale_bar_px: number | null;
-  content_url: string;
-  input_mode: "raw_sem" | "visionflux_annotated";
-  imported_measurements: number;
+  scale_label: string | null; scale_bar_px: number | null; content_url: string;
+  input_mode: "raw_sem" | "visionflux_annotated"; imported_measurements: number;
 };
-
 export type AnalysisJob = {
-  id: string;
-  image_id: string;
+  id: string; image_id: string;
   status: "QUEUED" | "ANALYZING" | "POSTPROCESSING" | "DONE" | "FAILED";
-  progress: number;
-  error_message: string | null;
-  model_version: string;
-  summary: Record<string, unknown>;
+  progress: number; error_message: string | null; model_version: string; summary: Record<string, unknown>;
 };
-
 export type AnalysisResult = {
-  analysis_id: string;
-  image_id: string;
-  image_url: string;
-  image_filename: string;
-  summary: Record<string, unknown>;
+  analysis_id: string; image_id: string; image_url: string; image_filename: string; summary: Record<string, unknown>;
   measurements: Array<{
-    id: string;
-    external_id: string | null;
-    x1: number;
-    y1: number;
-    x2: number;
-    y2: number;
-    width_px: number;
-    width_nm: number | null;
-    angle_deg: number;
-    confidence: number;
-    source: string;
-    metadata: Record<string, unknown>;
+    id: string; external_id: string | null; x1: number; y1: number; x2: number; y2: number;
+    width_px: number; width_nm: number | null; angle_deg: number; confidence: number; source: string; metadata: Record<string, unknown>;
   }>;
 };
-
 export type ReviewMeasurement = ReviewLine & {
-  width_px: number;
-  width_nm: number | null;
-  angle_deg: number;
-  edited: boolean;
-  source: string;
-  confidence: number | null;
+  width_px: number; width_nm: number | null; angle_deg: number; edited: boolean; source: string; confidence: number | null;
 };
+export type ReviewResponse = { id: string; analysis_id: string; status: "OPEN" | "APPROVED"; measurements: ReviewMeasurement[]; };
 
-export type ReviewResponse = {
-  id: string;
-  analysis_id: string;
-  status: "OPEN" | "APPROVED";
-  measurements: ReviewMeasurement[];
-};
-
-export function login(email: string, password: string) {
-  return request<AuthUser>("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
-}
-
-export function getCurrentUser() {
-  return request<AuthUser>("/api/auth/me");
-}
-
-export function changePassword(newPassword: string) {
-  return request<AuthUser>("/api/auth/change-password", { method: "POST", body: JSON.stringify({ new_password: newPassword }) });
-}
-
-export function logout() {
-  return request<{ status: string }>("/api/auth/logout", { method: "POST" });
-}
-
+export function login(email: string, password: string) { return request<AuthUser>("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }); }
+export function getCurrentUser() { return request<AuthUser>("/api/auth/me"); }
+export function changePassword(newPassword: string) { return request<AuthUser>("/api/auth/change-password", { method: "POST", body: JSON.stringify({ new_password: newPassword }) }); }
+export function logout() { return request<{ status: string }>("/api/auth/logout", { method: "POST" }); }
 export async function uploadImage(file: File, nmPerPixel?: number): Promise<ImageAsset> {
-  const body = new FormData();
-  body.append("file", file);
+  const body = new FormData(); body.append("file", file);
   if (nmPerPixel !== undefined && Number.isFinite(nmPerPixel)) body.append("nm_per_pixel", String(nmPerPixel));
   return request<ImageAsset>("/api/images", { method: "POST", body });
 }
+export function createAnalysis(imageId: string) { return request<AnalysisJob>("/api/analyses", { method: "POST", body: JSON.stringify({ image_id: imageId }) }); }
+export function getAnalysis(id: string) { return request<AnalysisJob>(`/api/analyses/${id}`); }
+export function getResult(id: string) { return request<AnalysisResult>(`/api/analyses/${id}/result`); }
+export function getReview(id: string) { return request<ReviewResponse>(`/api/analyses/${id}/review`); }
+export function saveReview(reviewId: string, patch: ReviewPatch) { return request<ReviewResponse>(`/api/reviews/${reviewId}`, { method: "PATCH", body: JSON.stringify(patch) }); }
+export function approveReview(reviewId: string) { return request<{ review_id: string; status: string; training_examples: number }>(`/api/reviews/${reviewId}/approve`, { method: "POST" }); }
+export function absoluteImageUrl(path: string) { return path.startsWith("http") ? path : `${API_BASE}${path}`; }
 
-export function createAnalysis(imageId: string) {
-  return request<AnalysisJob>("/api/analyses", { method: "POST", body: JSON.stringify({ image_id: imageId }) });
-}
+type ExportKind = "csv" | "orientation" | "thickness-range" | "overlay" | "labeled" | "bundle";
+type ExportOptions = { normalMinNm?: number; normalMaxNm?: number };
 
-export function getAnalysis(id: string) {
-  return request<AnalysisJob>(`/api/analyses/${id}`);
-}
-
-export function getResult(id: string) {
-  return request<AnalysisResult>(`/api/analyses/${id}/result`);
-}
-
-export function getReview(id: string) {
-  return request<ReviewResponse>(`/api/analyses/${id}/review`);
-}
-
-export function saveReview(reviewId: string, patch: ReviewPatch) {
-  return request<ReviewResponse>(`/api/reviews/${reviewId}`, { method: "PATCH", body: JSON.stringify(patch) });
-}
-
-export function approveReview(reviewId: string) {
-  return request<{ review_id: string; status: string; training_examples: number }>(`/api/reviews/${reviewId}/approve`, { method: "POST" });
-}
-
-export function absoluteImageUrl(path: string) {
-  return path.startsWith("http") ? path : `${API_BASE}${path}`;
-}
-
-export function exportUrl(analysisId: string, kind: "csv" | "overlay" | "labeled" | "bundle") {
-  return `${API_BASE}/api/analyses/${analysisId}/exports/${kind}`;
+export function exportUrl(analysisId: string, kind: ExportKind, options?: ExportOptions) {
+  const params = new URLSearchParams();
+  if (options?.normalMinNm !== undefined && Number.isFinite(options.normalMinNm)) params.set("min_nm", String(options.normalMinNm));
+  if (options?.normalMaxNm !== undefined && Number.isFinite(options.normalMaxNm)) params.set("max_nm", String(options.normalMaxNm));
+  const query = params.toString();
+  return `${API_BASE}/api/analyses/${analysisId}/exports/${kind}${query ? `?${query}` : ""}`;
 }

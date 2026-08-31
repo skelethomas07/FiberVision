@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,33 @@ def _finite_or_none(value: Any) -> float | None:
         return None
     return number if math.isfinite(number) else None
 
+
+
+
+def _apply_fibervision_review_profile(run: dict[str, Any]) -> bool:
+    """Use a recall-first post profile when validation selection is unavailable.
+
+    FiberVision is a human-review workflow: candidates can be filtered by model
+    confidence and then corrected/removed by the reviewer.  The v7 scientific
+    defaults are intentionally conservative and, without selection.json, can
+    reject nearly every site on dense unseen fields.  Only the unselected case
+    is relaxed; a future validation-selected profile remains authoritative.
+    """
+    if run.get("selection"):
+        return False
+    post = run.get("post")
+    if post is None:
+        return False
+    run["post"] = replace(
+        post,
+        seg_threshold=0.4,
+        min_validity=0.0,
+        min_seg_confidence=0.0,
+        junction_clear_scale=0.0,
+        boundary_tol=0.9,
+        spacing_px=12.0,
+    )
+    return True
 
 def _accepted_sites(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None or frame.empty:
@@ -100,6 +128,8 @@ class SemFiberEngine:
 
         device = pick_device(self.device_name)
         self._run = load_run(self.run_dir, device=device)
+        review_profile = _apply_fibervision_review_profile(self._run)
+        self._run["fibervision_review_profile"] = review_profile
         package_version = str(self._run.get("checkpoint", {}).get("package_version") or "")
         if package_version and package_version != "7.0.0":
             raise ValueError(f"expected sem_fiber_ai 7.0.0 checkpoint, got {package_version}")
@@ -126,6 +156,7 @@ class SemFiberEngine:
             save_maps=False,
             thick=False,
         )
+        summary["fibervision_review_profile"] = bool(run.get("fibervision_review_profile"))
         image_id = str(summary["image_id"])
         sites_path = output_dir / f"{image_id}_sites.csv"
         frame = pd.read_csv(sites_path) if sites_path.is_file() else pd.DataFrame()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from io import BytesIO, StringIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -44,6 +45,66 @@ def build_csv(rows) -> bytes:
             row.source,
             _status(row),
         ])
+    return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+
+
+def _fiber_angle_deg(row) -> float:
+    return (float(row.angle_deg) + 90.0) % 180.0
+
+
+def _orientation_degree_bin(row) -> int:
+    # Nearest whole degree over the requested inclusive 0..180 presentation.
+    # 180 is kept as the upper-edge bin instead of being wrapped back to 0.
+    angle = _fiber_angle_deg(row)
+    return max(0, min(180, int(math.floor(angle + 0.5))))
+
+
+def build_orientation_distribution_csv(rows) -> bytes:
+    """181 columns (0°..180°), each value is count/total and percentage."""
+    active = _active_rows(rows)
+    total = len(active)
+    counts = [0] * 181
+    for row in active:
+        counts[_orientation_degree_bin(row)] += 1
+
+    buffer = StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow([f"{degree}°" for degree in range(181)])
+    writer.writerow([
+        f"{count}/{total} ({(100.0 * count / total if total else 0.0):.2f}%)"
+        for count in counts
+    ])
+    return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+
+
+def build_thickness_range_csv(rows, normal_min_nm: float, normal_max_nm: float) -> bytes:
+    low = float(normal_min_nm)
+    high = float(normal_max_nm)
+    if not (math.isfinite(low) and math.isfinite(high)):
+        raise ValueError("normal thickness range must be finite")
+    if low < 0 or high < 0 or low > high:
+        raise ValueError("normal thickness range must satisfy 0 <= min <= max")
+
+    active = _active_rows(rows)
+    widths: list[float] = []
+    for row in active:
+        if row.width_nm is None or not math.isfinite(float(row.width_nm)):
+            raise ValueError("nm thickness is unavailable for one or more active measurements")
+        widths.append(float(row.width_nm))
+    total = len(widths)
+    inside = sum(1 for width in widths if low <= width <= high)
+    percent = 100.0 * inside / total if total else 0.0
+
+    buffer = StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "normal_min_nm", "normal_max_nm", "total_fibers",
+        "within_range_fibers", "within_range_percent", "within_range_pair",
+    ])
+    writer.writerow([
+        f"{low:.6f}", f"{high:.6f}", total, inside, f"{percent:.2f}",
+        f"{inside}/{total} ({percent:.2f}%)",
+    ])
     return ("\ufeff" + buffer.getvalue()).encode("utf-8")
 
 
