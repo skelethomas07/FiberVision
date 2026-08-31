@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,22 @@ from ..storage import ObjectStorage
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except (TypeError, ValueError):
+            pass
+    return value
 
 
 def run_analysis_job(job_id, session_factory, storage: ObjectStorage, engine: InferenceEngine, work_root: Path) -> None:
@@ -58,11 +75,11 @@ def run_analysis_job(job_id, session_factory, storage: ObjectStorage, engine: In
                     x1=item.x1, y1=item.y1, x2=item.x2, y2=item.y2,
                     width_px=item.width_px, width_nm=item.width_nm,
                     angle_deg=item.angle_deg, confidence=item.confidence,
-                    source=item.source, metadata_json=item.metadata,
+                    source=item.source, metadata_json=_json_safe(item.metadata),
                 ))
             for artifact_name, artifact_path in result.artifacts.items():
                 storage.put_file(f"analyses/{job_id}/{artifact_path.name}", artifact_path)
-            job.summary_json = result.summary
+            job.summary_json = _json_safe(result.summary)
             job.status = AnalysisStatus.DONE
             job.progress = 100
             job.completed_at = _now()

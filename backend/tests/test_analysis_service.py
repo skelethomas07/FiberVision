@@ -7,7 +7,7 @@ from app.db import Base
 from app.inference.contracts import AnalysisResult, MeasurementPrediction
 from app.models import AnalysisJob, AnalysisStatus, ImageAsset, ModelMeasurement
 from app.services.analysis import create_analysis
-from app.workers.analysis import run_analysis_job
+from app.workers.analysis import _json_safe, run_analysis_job
 
 
 class RecordingQueue:
@@ -117,3 +117,17 @@ def test_worker_failure_is_atomic_and_marks_failed(tmp_path):
     assert saved.status == AnalysisStatus.FAILED
     assert "boom" in saved.error_message
     assert count == 0
+
+
+def test_json_safe_replaces_non_finite_values_recursively():
+    payload = {
+        "unassigned_fraction": float("nan"),
+        "nested": [1.0, float("inf"), {"value": float("-inf")}],
+    }
+
+    cleaned = _json_safe(payload)
+
+    assert cleaned == {
+        "unassigned_fraction": None,
+        "nested": [1.0, None, {"value": None}],
+    }
